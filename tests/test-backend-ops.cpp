@@ -12263,6 +12263,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640, 1, true));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, 4, 640, 1, true));
+    // GSQ qwen4exp mixes: low-bit gate/up [2560 -> 640] (alone and as the fused gate/up pair, o = 2) and Q2_0 down
+    // [640 -> 2560]; 4096 tokens are 80 rows per expert
+    for (int n : {8, 512, 2048, 4096}) {
+        for (ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, true, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 512, 10, true, 640, n, 2560, 2));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, 128, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, 512, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, 1024, 2048));

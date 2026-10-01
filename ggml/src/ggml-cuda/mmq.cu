@@ -170,7 +170,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 src0_i->ne[0], src0_i->ne[1], src1->ne[1], (int64_t) (src0_i->nb[1] / ggml_type_size(src0_i->type)), src1->ne[1], (int64_t) (dst_i->nb[1] / sizeof(float)),
                 src0_i->ne[2], src1->ne[2], (int64_t) (src0_i->nb[2] / ggml_type_size(src0_i->type)), s12_q, (int64_t) (dst_i->nb[2] / sizeof(float)),
                 src0_i->ne[3], src1->ne[3], (int64_t) (src0_i->nb[3] / ggml_type_size(src0_i->type)), s13_q, (int64_t) (dst_i->nb[3] / sizeof(float)),
-                src1->ne[1]};
+                src1->ne[1], src1->ne[1]};
             ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         }
         return;
@@ -235,6 +235,13 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const int64_t s12_q = src1->ne[1] * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13_q = n_tokens*s12_q;
+
+    // as in ggml_cuda_mul_mat_q_impl: without it ncols_opt is 0, every J yields 0 tiles and the J selection stops at
+    // the smallest configured J (16) - a grid of n_tokens/16 * n_experts mostly-empty blocks
+    int64_t ncols_opt = n_tokens;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        ncols_opt = (n_tokens*n_expert_used + src0->ne[2] - 1) / src0->ne[2];
+    }
     for (int i = 0; i < 2; ++i) {
         const ggml_tensor * src0_i = src0s[i];
         ggml_tensor * dst_i = dsts[i];
@@ -252,7 +259,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src0_i->ne[0], src0_i->ne[1], ne_get_rows, s01, ne_get_rows, s1,
             src0_i->ne[2], src0_i->ne[2], s02, s12_q, s2,
             src0_i->ne[3], src1->ne[3], s03, s13_q, s3,
-            n_tokens};
+            n_tokens, ncols_opt};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     }
 }

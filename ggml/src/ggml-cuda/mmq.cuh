@@ -1642,9 +1642,23 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
         case GGML_TYPE_Q6_K:
             return rows_per_expert <= 12 ? 16 : rows_per_expert <= 24 ? 32 : rows_per_expert <= 48 ? 48 :
                 rows_per_expert <= 64 ? 32 : 128;
+        // the low-bit expert types of the GSQ qwen4exp mixes (IQ2_XXS..IQ3_XXS gate/up, Q2_0 down; 512 experts,
+        // 10 active: 80 rows per expert at ubatch 4096). J=48 stays with the full-tile path of
+        // mmq_use_rdna3_5_iq_id_j48, so the range up to 64 rows uses J_MID.
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 64 ? MMQ_IQ_ID_J_MID : 128;
         default:
             return 0;
     }
+}
+
+static constexpr bool mmq_rdna3_5_id_is_lowbit(const ggml_type type) {
+    return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
+        type == GGML_TYPE_IQ3_XXS;
 }
 
 static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int J) {
@@ -1659,6 +1673,13 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
             return J == 16 || J == 32 || J == 48 || J == 64 || J == 96 || J == 128;
+        // 80 and 96 only through GGML_LOWBIT_COMPACT_J
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+            return J == 16 || J == MMQ_IQ_ID_J_MID || J == 80 || J == 96 || J == 128;
         default:
             return false;
     }
@@ -1681,6 +1702,10 @@ static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 48));
 static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 32));
 static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q6_K, 32));
 static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ2_XS, 48));
+static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ3_XXS, 48));
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_IQ2_S,  80) == 128 && mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ2_S, 128));
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q2_0,   40) == MMQ_IQ_ID_J_MID);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_IQ2_XXS, 8) ==  16);
 static_assert(!mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q4_K, 128, 95) &&
               !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q5_K, 128, 95) &&
               !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q6_K, 128, 95) &&
@@ -1829,6 +1854,12 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         if constexpr (type == GGML_TYPE_Q6_K) {
             if (getenv("GGML_Q6_COMPACT_J")) {
                 J_rdna3_5 = atoi(getenv("GGML_Q6_COMPACT_J"));
+            }
+        }
+        if constexpr (mmq_rdna3_5_id_is_lowbit(type)) {
+            static const int J_env = getenv("GGML_LOWBIT_COMPACT_J") ? atoi(getenv("GGML_LOWBIT_COMPACT_J")) : 0;
+            if (J_rdna3_5 > 16 && mmq_rdna3_5_id_use_compact(type, J_env)) {
+                J_rdna3_5 = J_env;
             }
         }
         if (J_rdna3_5 != 0) {
