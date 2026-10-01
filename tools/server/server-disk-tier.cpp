@@ -1442,6 +1442,19 @@ void server_prompt_cache::disk_retire_bad() {
     disk_bad_runs.clear();
 }
 
+// the writer thread, before an object it writes: a restore reading now has the disk to itself - the conversation someone
+// waits for comes first, the one going out can wait. A few seconds at most, so restores in a row cannot keep the store
+// from being written. Returns the time it waited (us).
+int64_t server_prompt_cache::disk_yield() {
+    std::unique_lock<std::mutex> lk(disk_mu);
+    if (disk_readers == 0 || disk_stop) {
+        return 0;
+    }
+    const int64_t t0 = ggml_time_us();
+    disk_cv.wait_for(lk, std::chrono::seconds(10), [&] { return disk_readers == 0 || disk_stop; });
+    return ggml_time_us() - t0;
+}
+
 void server_prompt_cache::disk_writer() {
     std::unique_lock<std::mutex> lk(disk_mu);
     // the main loop sleeps when every slot is idle; after each job it is woken once, so a save that found the queue
@@ -1531,6 +1544,7 @@ void server_prompt_cache::disk_write_runs(disk_job & job) {
     std::map<std::pair<uint64_t, uint64_t>, uint64_t> fresh_run;   // runs this job writes -> file bytes
     std::map<uint64_t, uint64_t>                      fresh_ckpt;  // checkpoints this job writes -> file bytes
     uint64_t wrote = 0, wrote_ckpt = 0;
+    int64_t  yielded_us = 0;                       // left to restores
     bool lost = false;
     const std::string path = manifest_path(disk_dir, e.tokens);
 
@@ -1579,6 +1593,7 @@ void server_prompt_cache::disk_write_runs(disk_job & job) {
                 ok = false;
                 break;
             }
+            yielded_us += disk_yield();
             const std::string p = run_path(disk_dir, k.first, k.second);
             std::error_code ec;
             fs::create_directories(fs::path(p).parent_path(), ec);
@@ -1604,6 +1619,7 @@ void server_prompt_cache::disk_write_runs(disk_job & job) {
             if (have || fresh_ckpt.count(key)) {
                 continue;
             }
+            yielded_us += disk_yield();
             const std::string p = ckpt_path(disk_dir, key);
             uint64_t b = 0;
             ok = write_part(st, p + ".part", [&](spc_out & o) { return write_ckpt_body(o, c); }, b) && place(p + ".part", p);
@@ -1700,10 +1716,10 @@ void server_prompt_cache::disk_write_runs(disk_job & job) {
     disk_index.push_back(std::move(e));
     disk_evict(path);
 
-    SRV_INF(" - disk cache: wrote %d tokens in %.0f ms: %zu of %zu runs new (%.3f GiB), %zu checkpoints new (%.3f GiB); "
-            "brings back %lld tokens - %zu entries, %.1f GiB on disk\n",
-            n_tokens, (ggml_time_us() - t0) / 1000.0, fresh_run.size(), n_runs, wrote / GIB, fresh_ckpt.size(), wrote_ckpt / GIB,
-            (long long) n_exact, disk_index.size(), disk_bytes / GIB);
+    SRV_INF(" - disk cache: wrote %d tokens in %.0f ms (%.0f ms of it waiting for a restore): %zu of %zu runs new (%.3f GiB), "
+            "%zu checkpoints new (%.3f GiB); brings back %lld tokens - %zu entries, %.1f GiB on disk\n",
+            n_tokens, (ggml_time_us() - t0) / 1000.0, yielded_us / 1000.0, fresh_run.size(), n_runs, wrote / GIB,
+            fresh_ckpt.size(), wrote_ckpt / GIB, (long long) n_exact, disk_index.size(), disk_bytes / GIB);
 }
 
 // pick the entry, pin what it names up to the restore point, let the lock go (making room may save a conversation,
@@ -1815,6 +1831,22 @@ bool server_prompt_cache::load_runs(server_prompt & prompt, const server_tokens 
     if (before_restore) {
         before_restore((size_t) n);
     }
+    // from here on this only reads: the writer holds back until it is done (making room above may have queued a save,
+    // and a save may wait for the writer - so not before)
+    struct reading {
+        server_prompt_cache & c;
+        explicit reading(server_prompt_cache & cache) : c(cache) {
+            std::lock_guard<std::mutex> lk(c.disk_mu);
+            c.disk_readers++;
+        }
+        ~reading() {
+            {
+                std::lock_guard<std::mutex> lk(c.disk_mu);
+                c.disk_readers--;
+            }
+            c.disk_cv.notify_all();
+        }
+    } reading_now { *this };
 
     struct item {
         disk_run_ref    r;

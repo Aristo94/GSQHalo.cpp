@@ -749,6 +749,7 @@ struct server_prompt_cache {
     std::function<void()>                                disk_on_written;   // called by the writer after each job
     disk_job *                                           disk_current = nullptr;
     bool                                                 disk_stop    = false;
+    int                                                  disk_readers = 0;  // restores reading now: the writer waits for them
     std::thread                                          disk_thread;
 
     ~server_prompt_cache();
@@ -799,6 +800,7 @@ struct server_prompt_cache {
     // the writer's side, and helpers that expect disk_mu held
     void   disk_writer();
     void   disk_write_runs(disk_job & job);
+    int64_t disk_yield();
     void   disk_drop(const disk_entry & e, bool remove_file = true);
     void   disk_evict(const std::string & keep);
     void   disk_retire_bad();
