@@ -1803,7 +1803,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                               const std::function<void(size_t)> & before_restore, ckpt_paged_map * paged_out, disk_runs_state * runs_out) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1835,8 +1836,28 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    // disk tier: an entry of the store, when it beats what is in RAM, goes straight into the cache
+    if (disk_limit > 0) {
+        bool restored = false;
+        if (load_runs(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, f_keep_best, f_sim_best, before_restore, paged_out,
+                      runs_out, restored)) {
+            return restored;                       // attempted: whatever happened, the slot's own conversation went
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        if (before_restore) {
+            before_restore(it_best->prompt.tokens.size());
+        }
+        // a whole state replaces the slot's conversation: the runs it was writing are not this one's
+        if (runs_out) {
+            runs_out->tgt.clear();
+            runs_out->dft.clear();
+            runs_out->tokens.clear();
+            runs_out->spec.clear();
+        }
 
         {
             auto & data = it_best->data.main;
@@ -1875,6 +1896,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+
+        // a RAM-tier state brings its checkpoints whole: nothing of it is paged out
+        if (paged_out) {
+            ckpt_release(*paged_out);
+        }
     }
 
     return true;

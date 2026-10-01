@@ -1741,6 +1741,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-dir"}, "PATH",
+        "keep the prompt cache on disk in this directory as well (not the model download cache): a conversation's "
+        "rows are written in runs as it grows and restored after it left its slot or the server restarted",
+        [](common_params & params, const std::string & value) {
+            params.cache_dir_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-dir-max"}, "N",
+        string_format("set the maximum size of the prompt cache on disk in MiB (default: %d, -1 - no limit, 0 - disable)", params.cache_dir_max_mib),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-dir-max must be -1 or non-negative");
+            }
+            params.cache_dir_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-run"}, "N",
+        string_format("positions in a run of rows written to the prompt cache on disk (default: %d)", params.cache_run),
+        [](common_params & params, int value) {
+            if (value < 256) {
+                throw std::invalid_argument("cache-run must be at least 256");
+            }
+            params.cache_run = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RUN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ckpt-step"}, "N",
+        string_format("tokens between the older checkpoints a conversation leaves in the prompt cache on disk (default: %d)", params.cache_ckpt_step),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-ckpt-step must be non-negative");
+            }
+            params.cache_ckpt_step = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_CKPT_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

@@ -168,6 +168,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
+    llama_build_and_test(test-disk-tier.cpp) # disk tier store, no model: DISK_TIER_TEST_DIR, STRIX_DISK_DIRECT
+    target_include_directories(test-disk-tier PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-disk-tier PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)
