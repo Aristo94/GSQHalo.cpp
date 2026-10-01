@@ -35,6 +35,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_DISK_PERSIST,    // disk tier: POST /strix/persist, before the server is stopped
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -636,6 +637,9 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // false: no RAM tier (--cache-ram 0), the cache is there for the disk tier only and alloc() keeps nothing
+    bool ram = true;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -723,6 +727,9 @@ struct server_prompt_cache {
     bool        disk_has_mtmd  = false;
     int32_t     disk_run       = 4096;   // positions in a run (--cache-run, STRIX_PROMPT_CACHE_RUN)
     int64_t     disk_ckpt_step = 32768;  // a leaving conversation's older checkpoints kept this far apart (--cache-ckpt-step)
+    // halobox: a shorter conversation is processed again rather than stored - its recurrent state and checkpoints
+    // (~110 MiB each for qwen4exp) cost more disk, and LRU room taken from long conversations, than its prefill costs time
+    int32_t     disk_min_tokens = 1024;
     int64_t     disk_seq       = 0;
     uint64_t    disk_bytes     = 0;      // entries, and every object once
 
