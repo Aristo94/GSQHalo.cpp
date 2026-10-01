@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <vector>
 
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
@@ -516,6 +518,56 @@ static __global__ void qsa_pack_v(const char * src, uint16_t * dst, size_t nb1, 
         *reinterpret_cast<const uint16_t *>(in+2*nb1), *reinterpret_cast<const uint16_t *>(in+3*nb1));
 }
 
+// QSA_STATS=1: per call, the size of the per-group union against a single query's selection (both in blocks), the
+// share of 16-row tiles that see a selected key per chunk, and the chunk load per key-range split. Synchronous
+// copies, so only outside graph capture (GGML_CUDA_DISABLE_GRAPHS=1).
+static void qsa3_stats(cudaStream_t stream, const ggml_tensor * dst, const int n_q, const int nk, const int ns, const int ngroups,
+                       const int cap, const int * ucount_d, const uint16_t * ublk_d, const uint16_t * umask_d) {
+    cudaStreamCaptureStatus st;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &st));
+    if (st != cudaStreamCaptureStatusNone) { fprintf(stderr, "QSA_STATS: skipped during graph capture\n"); return; }
+    std::vector<int> uc(ngroups);
+    std::vector<uint16_t> ub((size_t) ngroups * cap), um((size_t) ngroups * cap);
+    CUDA_CHECK(cudaMemcpyAsync(uc.data(), ucount_d, uc.size() * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ub.data(), ublk_d, ub.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(um.data(), umask_d, um.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int nsplit = std::clamp((int) (((size_t) nk * 1024 + (24u << 20) - 1) / (24u << 20)), 1, 8);
+    const int bps = ((nk / 4 + nsplit - 1) / nsplit + 3) & ~3;
+    std::vector<int> ublocks; ublocks.reserve(ngroups);
+    std::vector<double> range_chunks(nsplit, 0.0);
+    double sel = 0, nsel = 0, tiles = 0, chunks = 0, rows_sel = 0;
+    for (int g = 0; g < ngroups; ++g) {
+        const uint16_t * b = ub.data() + (size_t) g * cap, * mk = um.data() + (size_t) g * cap;
+        int u = 0, per_q[4] = {0, 0, 0, 0};
+        for (int i = 0; i < uc[g]; ++i) {
+            if (b[i] == 0xFFFFu) { continue; }
+            ++u;
+            for (int qi = 0; qi < 4; ++qi) { per_q[qi] += (mk[i] >> (4*qi)) & 0xFu ? 1 : 0; }
+        }
+        ublocks.push_back(u);
+        for (int qi = 0; qi < 4; ++qi) { if (4*g + qi < n_q) { sel += per_q[qi]; nsel += 1; rows_sel += per_q[qi] * 12.0; } }
+        for (int c = 0; c < uc[g] / 4; ++c) {
+            uint32_t qa = 0;
+            for (int j = 0; j < 4; ++j) { qa |= mk[4*c + j]; }
+            const bool a0 = qa & 0xFu, a1 = qa & 0xF0u, a2 = qa & 0xF00u, a3 = qa & 0xF000u;
+            tiles += (a0 || a1) + (a1 || a2) + (a2 || a3);
+            chunks += 1;
+            range_chunks[std::min((int) b[4*c] / bps, nsplit - 1)] += 1;
+        }
+    }
+    std::vector<int> sorted = ublocks; std::sort(sorted.begin(), sorted.end());
+    double umean = 0; for (int u : ublocks) { umean += u; }
+    umean /= std::max(1, ngroups);
+    const double smean = sel / std::max(1.0, nsel);
+    fprintf(stderr, "QSA_STATS %s n_q=%d nk=%d ns=%d U_mean=%.1f U_p90=%d U_max=%d sel_mean=%.1f U/sel=%.3f U/512=%.3f "
+            "tiles_active=%.3f useful_rows=%.3f split=%d chunks/range=",
+            dst->name, n_q, nk, ns, umean, sorted[(size_t) (0.9 * (sorted.size() - 1))], sorted.back(), smean, umean / std::max(1.0, smean),
+            umean / 512.0, tiles / std::max(1.0, 3 * chunks), rows_sel / std::max(1.0, 48.0 * 4 * chunks), nsplit);
+    for (int r = 0; r < nsplit; ++r) { fprintf(stderr, "%s%.0f", r ? "/" : "", range_chunks[r] / std::max(1, ngroups)); }
+    fprintf(stderr, "\n");
+}
+
 void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
     float scale; memcpy(&scale, dst->op_params, 4);
@@ -552,6 +604,8 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
                                 (const int *) srow.get(), (const int *) sflag.get(), ublk.get(), umask.get(), ucount.get(), cap);
         CUDA_CHECK(cudaGetLastError());
     }
+    static const bool qsa_stats = getenv("QSA_STATS") && atoi(getenv("QSA_STATS")) != 0;
+    if (qsa_stats) { qsa3_stats(ctx.stream(), dst, n_q, nk, ns, ngroups, cap, ucount.get(), ublk.get(), umask.get()); }
     qsa3_layout layout{q->nb[1], q->nb[2], dst->nb[1], dst->nb[2], m ? m->nb[1] : 0,
                        k->nb[1], v->nb[1], k->nb[2], v->nb[2], nk, n_q, 12, cap, scale};
     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
