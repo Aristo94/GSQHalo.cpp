@@ -13758,6 +13758,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,false));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2560));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2561));
+    // deep cache, fewer than keys/128 queries: the automatic QSA_DIRECT choice reads K/V without the pack
+    test_cases.emplace_back(new test_qsa_prefill_maskless(640,135168,2051));
+    test_cases.emplace_back(new test_qsa_prefill(520,135168,2051));
     test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));
     test_cases.emplace_back(new test_qsa_prefill(640,4096,257,true,true));
     for (int n_blocks : {512, 700, 2048}) for (int n_query : {1, 3, 9, 64, 127, 130}) test_cases.emplace_back(new test_qsa_expand(n_blocks, n_query));

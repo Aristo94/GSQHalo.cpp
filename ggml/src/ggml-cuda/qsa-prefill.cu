@@ -574,8 +574,11 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
     // QSA_DIRECT: -1/auto picks direct f16 reads when the attention is small against the cache
     // (the pack is O(n_kv) per ubatch), 0 always packs, 1 always reads direct. Both paths are bit-identical.
+    // The direct V gather (four 2-byte loads per dim and block) costs ~2.5 ns per (query, union block), the pack
+    // ~29 ns per key (gfx1151, 128K: 4096 queries x ~1360 union blocks -> attention 40 -> 27 ms/layer for a 3.9 ms
+    // pack), so direct only pays off for ubatches below ~nk/128 queries.
     static const int qsa_direct_cfg = getenv("QSA_DIRECT") ? atoi(getenv("QSA_DIRECT")) : -1;
-    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 32 < (size_t) nk);
+    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 128 < (size_t) nk);
     ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_direct ? 0 : ggml_nelements(k));
     ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
     if (!qsa_direct) {
