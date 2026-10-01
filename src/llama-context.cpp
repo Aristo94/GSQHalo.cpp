@@ -1502,6 +1502,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         t_inputs = ggml_time_us() - t_inputs_us;
+
+        if (ple_pf_tokens) {
+            // posix_fadvise readahead on a background thread; a wrong prediction costs readahead and nothing else
+            extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens, int32_t start);
+            qwen4exp_ple_prefetch(model, ple_pf_tokens, ple_pf_n, ple_pf_start);
+            ple_pf_tokens = nullptr;
+        }
         if (graph_timing) {
             LLAMA_LOG_WARN("graph-timing: n_tokens=%3u gtype=%d reused=%d build=%.2f alloc=%.2f inputs=%.2f ms nodes=%d\n",
                            ubatch.n_tokens, (int) gtype, (int) reused, t_build/1000.0, t_alloc/1000.0, t_inputs/1000.0,
@@ -1823,14 +1830,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
 
-    {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
-        // posix_fadvise only, so a wrong prediction costs readahead and nothing else
-        extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
-        const llama_batch & batch = balloc->get_batch();
-        if (model.arch == LLM_ARCH_QWEN4EXP && batch.token && batch.n_tokens >= 4096) {
-            qwen4exp_ple_prefetch(model, batch.token, batch.n_tokens);
-        }
-    }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {
@@ -1947,7 +1946,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        if (n_tokens_prev == 0) {
+            // the per-layer-embedding rows of the later ubatches are prefetched by process_ubatch once the first
+            // ubatch has its inputs, so the reads overlap its graph and do not compete with its own cold gather
+            const llama_batch & batch = balloc->get_batch();
+            if (model.arch == LLM_ARCH_QWEN4EXP && batch.token && (uint32_t) batch.n_tokens > ubatch.n_tokens) {
+                ple_pf_tokens = batch.token;
+                ple_pf_n      = batch.n_tokens;
+                ple_pf_start  = (int32_t) ubatch.n_tokens;
+            }
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        ple_pf_tokens = nullptr;
+
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module

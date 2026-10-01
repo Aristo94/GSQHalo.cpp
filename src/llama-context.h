@@ -395,6 +395,12 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // qwen4exp: per-layer-embedding rows of the later ubatches of the current batch, prefetched by process_ubatch
+    // between the first ubatch's inputs and its graph launch (see decode)
+    const llama_token * ple_pf_tokens = nullptr;
+    int32_t             ple_pf_n      = 0;
+    int32_t             ple_pf_start  = 0;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

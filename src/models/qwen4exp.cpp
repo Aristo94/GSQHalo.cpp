@@ -1798,8 +1798,8 @@ public:
 // (hundreds of thousands of scattered ~90-byte reads with the GPU idle). The same row indices are computed here for
 // a contiguous single-sequence prefill and the page cache is warmed for them while the previous chunk is still on
 // the GPU. Advice only, so a wrong prediction (multiple sequences, an image batch) costs readahead and nothing else.
-void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens) {
-    if (!tokens || n_tokens < 4096) {
+void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens, int32_t start) {
+    if (!tokens || n_tokens < 4096 || start >= n_tokens) {
         return;
     }
     // llama_context::decode calls this for every architecture, so the downcast below is only valid
@@ -1825,12 +1825,13 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
     const auto multipliers = hp.ple_layer_multipliers;
     const auto vocab_sizes = hp.ple_head_vocab_sizes;
     const auto offsets = hp.ple_head_offsets;
+    // rows from token `start` on; the n-gram context still reads the tokens before it
     std::thread([disk = std::move(disk), multipliers, vocab_sizes, offsets,
-                 toks = std::move(toks), n_gram, n_heads, per_gram, eos]() {
+                 toks = std::move(toks), n_gram, n_heads, per_gram, eos, start]() {
         const int64_t n = (int64_t) toks.size();
-        std::vector<int32_t> idx((size_t) n_heads * n);
+        std::vector<int32_t> idx((size_t) n_heads * (n - start));
         std::vector<int64_t> ctx(n_gram);
-        for (int64_t i = 0; i < n; ++i) {
+        for (int64_t i = start; i < n; ++i) {
             ctx[0] = toks[i];
             bool cut = false;
             for (int64_t s = 1; s < n_gram; ++s) {
@@ -1847,7 +1848,7 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
                 const int64_t base = (g - 2) * per_gram;
                 for (int64_t q = 0; q < per_gram; ++q) {
                     const int64_t h_i = base + q;
-                    idx[(size_t) i * n_heads + h_i] = (int32_t) (mixed % vocab_sizes[h_i] + offsets[h_i]);
+                    idx[(size_t) (i - start) * n_heads + h_i] = (int32_t) (mixed % vocab_sizes[h_i] + offsets[h_i]);
                 }
             }
         }
@@ -1857,6 +1858,17 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
+    // LLAMA_INPUT_TIMING=1: split the host time of this input into its phases
+    static const bool ple_timing = getenv("LLAMA_INPUT_TIMING") && atoi(getenv("LLAMA_INPUT_TIMING")) != 0;
+    const int64_t tp0 = ggml_time_us();
+    int64_t tp1 = 0, tp2 = 0, tp3 = 0;
+    auto ple_log = [&](const char * path) {
+        if (ple_timing) {
+            const int64_t tp4 = ggml_time_us();
+            LLAMA_LOG_WARN("ple-timing: %s n_tokens=%u prev=%.2f idx=%.2f gather=%.2f upload=%.2f ms\n", path, ubatch->n_tokens,
+                           (tp1 - tp0) / 1000.0, (tp2 - tp1) / 1000.0, (tp3 - tp2) / 1000.0, (tp4 - tp3) / 1000.0);
+        }
+    };
 
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
     // stand in the image token id that the reference hashes, or EOS if the file has no such key
@@ -1886,6 +1898,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
+    tp1 = ggml_time_us();
 
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it
@@ -1914,6 +1927,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    tp2 = ggml_time_us();
 
     if (embd != nullptr && !pmodel.ple_disk) {
         // host-resident table: dequantize the rows exactly as the CPU get_rows would (same to_float)
@@ -1990,7 +2005,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                 }
             }
         }
+        tp3 = ggml_time_us();
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+        ple_log("host");
         return;
     }
 
@@ -2003,7 +2020,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(embd != nullptr && rows == nullptr);
         embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
         pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
+        tp3 = ggml_time_us();
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+        ple_log("disk");
         return;
     }
 
