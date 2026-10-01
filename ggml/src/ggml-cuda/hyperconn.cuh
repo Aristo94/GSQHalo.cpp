@@ -55,7 +55,7 @@ struct ggml_cuda_hc_combine_norm_args {
     const uint16_t *    res_in_bf16  = nullptr;   // `residual` is BF16 in place (marked bf16-only)
     const uint16_t *    blk_in_bf16  = nullptr;
     uint16_t *          res_out_bf16 = nullptr;
-    const ggml_tensor * w_inject     = nullptr;   // [hc * n_embd, hc] F32 weight
+    const ggml_tensor * w_inject     = nullptr;   // [hc * n_embd, hc] F32 or BF16 weight
     ggml_tensor *       out_inject   = nullptr;   // [hc, T] F32, the skipped MUL_MAT node
 };
 

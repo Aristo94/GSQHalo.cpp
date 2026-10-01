@@ -405,7 +405,8 @@ __device__ __forceinline__ uint32_t hc_pack2(const float a, const float b) {
 }
 
 // One (token, stream) row of the combine + norm; with INJECT it also accumulates the row's share of the next mix's inject projection.
-template <bool INJECT>
+// The inject weight is F32 (UD mixes) or BF16 (GSQ mixes, WBF16).
+template <bool INJECT, bool WBF16 = false>
 static __device__ __forceinline__ void hc_combine_norm_row_b256(
         const int c, const int t, const int hc, float * s_sum,
         const float * inject, const float * residual,
@@ -413,7 +414,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps,
-        const float * w_inj, float * inj) {
+        const void * w_inj, float * inj) {
     const int tid = threadIdx.x;
     const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
     const float x2 = hc_sigmoid(x1);
@@ -470,7 +471,10 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
             if constexpr (INJECT) {
 #pragma unroll
                 for (int r = 0; r < HC_INJ_HC; ++r) {
-                    const float2 wv = *(const float2 *)(w_inj + (int64_t) r * hc * n_embd + (int64_t) c * n_embd + col);
+                    const int64_t wi = (int64_t) r * hc * n_embd + (int64_t) c * n_embd + col;
+                    float2 wv;
+                    if constexpr (WBF16) { const uint32_t u = *(const uint32_t *)((const uint16_t *) w_inj + wi); wv = make_float2(hc_lo(u), hc_hi(u)); }
+                    else                 { wv = *(const float2 *)((const float *) w_inj + wi); }
                     inj[r] += wv.x * v0 + wv.y * v1;
                 }
             }
@@ -481,7 +485,8 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
             if constexpr (INJECT) {
 #pragma unroll
                 for (int r = 0; r < HC_INJ_HC; ++r) {
-                    inj[r] += w_inj[(int64_t) r * hc * n_embd + (int64_t) c * n_embd + col] * v0;
+                    const int64_t wi = (int64_t) r * hc * n_embd + (int64_t) c * n_embd + col;
+                    inj[r] += (WBF16 ? hc_bf2f32(((const uint16_t *) w_inj)[wi]) : ((const float *) w_inj)[wi]) * v0;
                 }
             }
         }
@@ -501,20 +506,21 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
 }
 
 // One block per token over all HC_INJ_HC streams: the rows of hc_combine_norm_f32_b256 plus the next mix's inject projection.
+template <bool WBF16>
 static __global__ void __launch_bounds__(HC_CN_BLOCK2, 2) hc_combine_norm_inject_f32_b256(
         const float * inject, const float * residual,
         const float * block_out, const float * gamma,
         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps,
-        const float * w_inj, float * out_inj) {
+        const void * w_inj, float * out_inj) {
     __shared__ float s_sum[HC_INJ_HC][32];
     __shared__ float s_inj[HC_INJ_HC][HC_CN_BLOCK2 / WARP_SIZE];
     const int t = blockIdx.x;
     float inj[HC_INJ_HC] = {};
 #pragma unroll
     for (int c = 0; c < HC_INJ_HC; ++c) {
-        hc_combine_norm_row_b256<true>(c, t, HC_INJ_HC, s_sum[c], inject, residual, block_out, gamma,
+        hc_combine_norm_row_b256<true, WBF16>(c, t, HC_INJ_HC, s_sum[c], inject, residual, block_out, gamma,
             out_res, out_xn, out_xn_bf16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
             n_embd, s1, b1, s2, b2, eps, w_inj, inj);
     }
@@ -569,14 +575,16 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     if (a.out_inject) {
         GGML_ASSERT(hc == HC_INJ_HC && a.w_inject && ggml_nelements(a.out_inject) == hc * n_tokens &&
                     a.w_inject->ne[0] == n_embd * hc && a.w_inject->ne[1] == hc);
+        GGML_ASSERT(a.w_inject->type == GGML_TYPE_F32 || a.w_inject->type == GGML_TYPE_BF16);
         const ggml_cuda_kernel_launch_params lpi(dim3((int) n_tokens, 1, 1), HC_CN_BLOCK2, 0, ctx.stream());
-        ggml_cuda_kernel_launch(hc_combine_norm_inject_f32_b256, lpi,
+        auto kernel = a.w_inject->type == GGML_TYPE_BF16 ? hc_combine_norm_inject_f32_b256<true> : hc_combine_norm_inject_f32_b256<false>;
+        ggml_cuda_kernel_launch(kernel, lpi,
             (const float *) a.inject->data, (const float *) a.residual->data,
             (const float *) a.block_out->data, (const float *) a.gamma->data,
             (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
             a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
             (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps,
-            (const float *) a.w_inject->data, (float *) a.out_inject->data);
+            (const void *) a.w_inject->data, (float *) a.out_inject->data);
         return;
     }
 

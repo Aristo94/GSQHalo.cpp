@@ -3833,10 +3833,14 @@ struct test_cont_sigmoid_mul : public test_case {
 
 struct test_hc_combine_norm_inject : public test_case {
     const int embd, hc, tokens;
+    const ggml_type type_w;   // inject weight: F32 (UD mixes) or BF16 (GSQ mixes)
     ggml_tensor * out_res = nullptr, * out_norm = nullptr, * out_inj = nullptr;
-    test_hc_combine_norm_inject(int embd, int hc, int tokens) : embd(embd), hc(hc), tokens(tokens) {}
+    test_hc_combine_norm_inject(int embd, int hc, int tokens, ggml_type type_w = GGML_TYPE_F32)
+        : embd(embd), hc(hc), tokens(tokens), type_w(type_w) {}
     std::string op_desc(ggml_tensor *) override { return "HC_COMBINE_NORM_INJECT"; }
-    std::string vars() override { return VARS_TO_STR3(embd, hc, tokens); }
+    std::string vars() override { return VARS_TO_STR4(embd, hc, tokens, type_w); }
+    // a BF16 weight makes the CPU reference round the activations to BF16 (NMSE ~3e-6 on the unfused path too)
+    double max_nmse_err() override { return type_w == GGML_TYPE_F32 ? 1e-7 : 5e-5; }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return {out_res, out_norm, out_inj}; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -3844,7 +3848,7 @@ struct test_hc_combine_norm_inject : public test_case {
         ggml_tensor * block    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
         ggml_tensor * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
         ggml_tensor * gamma    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);
-        ggml_tensor * w_inj    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, int64_t(embd) * hc, hc);
+        ggml_tensor * w_inj    = ggml_new_tensor_2d(ctx, type_w, int64_t(embd) * hc, hc);
         ggml_tensor * weight   = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / hc)), 2.0f);
         weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
         if (gf) { ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, weight); }
@@ -11096,12 +11100,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int tokens : {128, 511, 512, 513, 1024}) {
-        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_BF16}) {
             test_cases.emplace_back(new test_hc_f32_consumer(tokens, type));
         }
     }
     for (int tokens : {128, 512, 1024}) {
-        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_BF16}) {
             test_cases.emplace_back(new test_hc_chain(tokens, type));
         }
     }
@@ -11151,6 +11155,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int tokens : {64, 512, 2049}) {
         test_cases.emplace_back(new test_hc_combine_norm_inject(2560, 4, tokens));
+        test_cases.emplace_back(new test_hc_combine_norm_inject(2560, 4, tokens, GGML_TYPE_BF16));
     }
     for (bool flat : {false, true}) {
         for (int tokens : {1, 7, 2048}) {
@@ -12241,6 +12246,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 256, 1000, 3, 1));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 512, 640, 4, 1));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_F32,  320, 2560, 4, 1));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_BF16, 320, 2560, 4, 512));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_BF16, 320, 2560, 4, 1024));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 14, 3));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 16, 3));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 16, 3, true));
@@ -13765,6 +13772,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_moe_prefill(true, 4096, type));
             }
             test_cases.emplace_back(new test_moe_prefill(false, 4096, GGML_TYPE_Q2_0));
+        }
+        return test_cases;
+    }
+    if (getenv("GGML_PERF_DENSE")) {
+        // dense GEMMs of the GSQ qwen4exp mixes: attn_qkv [2560 -> 10240], ssm_out / attn_output [6144 -> 2560]
+        for (int n : {2048, 4096}) {
+            for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 10240, n, 2560, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2560, n, 6144, {1, 1}, {1, 1}));
+            }
         }
         return test_cases;
     }

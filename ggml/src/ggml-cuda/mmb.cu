@@ -1160,12 +1160,12 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    // Q8_0 HC down [10240 -> 320]: at 128x128 tiles only 3x(T/128) blocks with a K=10240 loop (occupancy-bound).
+    // Q8_0 / BF16 (GSQ) HC down [10240 -> 320]: at 128x128 tiles only 3x(T/128) blocks with a K=10240 loop (occupancy-bound).
     // Narrower tiles keep the per-output K accumulation order (bit-identical) but launch 3-10x more blocks.
     // MMB_HCD_TILE: 0 = generic path, 1 <64,128,32,32>, 2 <32,128,32,16>, 3 <64,64,32,16>, 4 <32,64,16,16>, 5 <64,32,16,16>
     const uint16_t * hc_shadow = mmb_is_hc_q8(src0) ? mmb_shadow_lookup(ctx, src0) : nullptr;
     static const int HCD = getenv("MMB_HCD_TILE") ? atoi(getenv("MMB_HCD_TILE")) : 3;
-    if (HCD && src0->type == GGML_TYPE_Q8_0 && M <= 384 && K >= 4096 && T >= 512) {
+    if (HCD && (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_BF16) && M <= 384 && K >= 4096 && T >= 512) {
         const bool hbf = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0;
         uint16_t * Dh2 = hbf ? (uint16_t *) dst->data : nullptr; const bool sf = !hbf;
         auto go = [&](auto tag, const uint8_t * WP) {
@@ -1177,8 +1177,9 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             else if (HCD == 6) { dim3 g(1, (T + 31) / 32);               mmb_dense_kernel<384, 32, 96, 16, WT><<<g, MMB_NT, 0, stream>>>(WP, xhp, D, Dh2, sf, M, K, T); }
             else               { dim3 g((M + 63) / 64, (T + 31) / 32);   mmb_dense_kernel<64, 32, 16, 16, WT><<<g, MMB_NT, 0, stream>>>(WP, xhp, D, Dh2, sf, M, K, T); }
         };
-        if (hc_shadow) go(std::integral_constant<int, 2>{}, (const uint8_t *) hc_shadow);
-        else           go(std::integral_constant<int, 1>{}, W);
+        if (src0->type == GGML_TYPE_BF16) go(std::integral_constant<int, 2>{}, W);
+        else if (hc_shadow)               go(std::integral_constant<int, 2>{}, (const uint8_t *) hc_shadow);
+        else                              go(std::integral_constant<int, 1>{}, W);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1246,7 +1247,7 @@ bool ggml_cuda_mmb_blk16() { return true; }
 bool ggml_cuda_mmb_res16()  { return true; }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
-    if (!mmb_gatemix_flag() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    if (!mmb_gatemix_flag() || hc != 4 || !(mmb_quant_type(w->type) || w->type == GGML_TYPE_BF16) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
     if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
@@ -1258,8 +1259,9 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const bool store_f32 = !(outh && ggml_cuda_mmb_is_bf16_only(ctx, dst));
     dim3 grid(E / 32, (T + 127) / 128);
     const uint16_t * hc_shadow = mmb_is_hc_q8(w) ? mmb_shadow_lookup(ctx, w) : nullptr;
-    if (hc_shadow) {
-        hc_gate_mix_kernel<4, 2><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) hc_shadow, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
+    if (hc_shadow || w->type == GGML_TYPE_BF16) {   // BF16 weights (GSQ mixes) are laid out like the shadow
+        const uint8_t * wb = hc_shadow ? (const uint8_t *) hc_shadow : (const uint8_t *) w->data;
+        hc_gate_mix_kernel<4, 2><<<grid, MMB_NT, 0, stream>>>(wb, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
     } else
     mmb_dispatch_quant(w->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;

@@ -4152,7 +4152,7 @@ static int ggml_cuda_match_hc_combine_norm(ggml_cgraph * cgraph, int i,
                     const ggml_tensor * xi = mm ? mm->src[1] : nullptr;
                     if (mm && mm->op == GGML_OP_MUL_MAT && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                         (xi == mulg || (xi->view_src == mulg && xi->view_offs == 0)) && ggml_is_contiguous(xi) &&
-                        wi->op == GGML_OP_NONE && wi->type == GGML_TYPE_F32 && ggml_is_contiguous(wi) &&
+                        wi->op == GGML_OP_NONE && (wi->type == GGML_TYPE_F32 || wi->type == GGML_TYPE_BF16) && ggml_is_contiguous(wi) &&
                         wi->ne[0] == n_embd * hc && wi->ne[1] == hc && wi->ne[2] == 1 && wi->ne[3] == 1 &&
                         mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) &&
                         mm->ne[0] == hc && mm->ne[1] == n_tok && mm->ne[2] == 1 && mm->ne[3] == 1) {
@@ -6012,7 +6012,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: GEMM + sigmoid + mix in one kernel
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         const ggml_tensor * w = node->src[0], * lo = node->src[1];
-        if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(*cuda_ctx, w, lo, node)) {
+        if ((ggml_is_quantized(w->type) || w->type == GGML_TYPE_BF16) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(*cuda_ctx, w, lo, node)) {
             ggml_cuda_hc_mix_args ma;
             const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
             if (count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
