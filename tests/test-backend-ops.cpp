@@ -12589,8 +12589,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 1.0f, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 1.0f, 64));
 
+    // dense MMQ at the J=128 tile of the GSQ dense types (split_j + prefetch on RDNA3.5), M = 384 full tiles, M = 320 fallback
+    for (ggml_type type_a : {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q2_0}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 384, 512, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 320, 1024, 768, {1, 1}, {1, 1}));
+    }
     // one activation, several dense MMQ readers: same / mixed Q8_1 layouts, nodes in between, in-place writer
-    for (int64_t n : {64, 300}) {
+    for (int64_t n : {64, 300, 512}) {
         test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S}, {256, 128, 0}, n, 512));
         test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K}, {128, 384, 0}, n, 512));
         test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}, {256, 128, 64}, n, 512, true));
@@ -13846,6 +13851,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 10240, n, 2560, {1, 1}, {1, 1}));
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2560, n, 6144, {1, 1}, {1, 1}));
+                // GGML_PERF_DENSE=all: attn_gate / attn_q [2560 -> 6144 / 12288], shared expert, attn_k/v [2560 -> 640 / 512]
+                if (strcmp(getenv("GGML_PERF_DENSE"), "all") == 0 && n == 4096) {
+                    for (int64_t m : {6144, 12288, 640, 512}) {
+                        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, 2560, {1, 1}, {1, 1}));
+                    }
+                }
             }
         }
         return test_cases;

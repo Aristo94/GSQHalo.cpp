@@ -386,6 +386,18 @@ static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, 
     return ggml_cuda_mmq_get_config(type, J, fallback).rows_per_warp();
 }
 
+// MMA data layout: with two warps per strip of rows_per_warp rows, the two warps of a strip split the J columns of
+// the tile (bit-identical, every output keeps its K order).
+static constexpr __device__ bool ggml_cuda_mmq_get_split_j(ggml_type type, int J, bool fallback) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    return ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size() *
+        ggml_cuda_mmq_get_rows_per_warp(type, J, fallback) == 2*ggml_cuda_mmq_get_I(type, J, fallback);
+#else
+    return type == GGML_TYPE_Q8_0 && J == 128 && !fallback && ggml_cuda_mmq_get_I(type, J, fallback) == 64 &&
+        ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size() == 8;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
 #define MMQ_DP4A_TXS_Q4_0    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_0   + I/QI4_0,     0}
 #define MMQ_DP4A_TXS_Q4_1    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_1   + I/QI4_1,     0}
 #define MMQ_DP4A_TXS_Q8_0    tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*2/QI8_0 + I/(QI8_0/2), 0}
@@ -493,12 +505,11 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
     constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
-    constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
-    constexpr bool split_j      = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && I == 64 && nwarps == 8;
+    constexpr bool split_j      = ggml_cuda_mmq_get_split_j(type, J, fallback);
     constexpr int j_group       = split_j ? J/2 : J;
 
-    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
-    const int warp_j = split_j ? threadIdx.y / 4 : 0;
+    const int warp_i = split_j ? threadIdx.y % (nwarps/2) : threadIdx.y;
+    const int warp_j = split_j ? threadIdx.y / (nwarps/2) : 0;
     const int i0 = (warp_i / ntx) * (ntx*tile_C::I);
 
     const bool y_scale_used = y_scale != nullptr;
@@ -908,7 +919,9 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
            (type == GGML_TYPE_Q5_K    &&  J == 32)              ||
            (type == GGML_TYPE_Q4_K    &&  J == 48)              ||
            (type == GGML_TYPE_IQ2_S   &&  J == 128)             ||
-           (type == GGML_TYPE_IQ3_XXS &&  J == 128);
+           (type == GGML_TYPE_IQ3_XXS &&  J == 128)             ||
+           ((type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S ||
+             type == GGML_TYPE_Q4_K   || type == GGML_TYPE_Q5_K) && J == 128 && !fallback); // split_j: half the accumulators
 #else
     return false;
 #endif // defined(RDNA3_5) && defined(AMD_WMMA_AVAILABLE)
