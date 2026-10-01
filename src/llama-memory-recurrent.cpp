@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -34,6 +35,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_snap_ok.assign(n_seq_max, 1);
 
     cells.clear();
     cells.resize(mem_size);
@@ -195,7 +197,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                // the snapshots must come from the last ubatch: a large prefill ubatch writes none
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq && rs_snap_ok[seq_id]) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -249,6 +252,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (seq_id_src == seq_id_dst) {
         return;
+    }
+
+    // the copy shares the source's cell and with it its rollback snapshots
+    if (seq_id_src >= 0 && seq_id_dst >= 0 && (size_t) seq_id_src < rs_snap_ok.size() && (size_t) seq_id_dst < rs_snap_ok.size()) {
+        rs_snap_ok[seq_id_dst] = rs_snap_ok[seq_id_src];
     }
 
     if (p0 < 0) {
@@ -401,6 +409,32 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+bool llama_rs_keep_snapshots(uint32_t n_rs_seq, uint32_t n_seq_tokens) {
+    static const int64_t max_tokens = [] {
+        const char * env = getenv("LLAMA_RS_SNAPSHOT_MAX");
+        return env ? (int64_t) atoll(env) : (int64_t) 255;
+    }();
+    if (n_rs_seq == 0) {
+        return false;
+    }
+    return max_tokens <= 0 || (int64_t) n_seq_tokens <= std::max<int64_t>(max_tokens, (int64_t) n_rs_seq + 1);
+}
+
+void llama_memory_recurrent::note_rs_snapshots(const llama_ubatch & ubatch) {
+    if (n_rs_seq == 0) {
+        return;
+    }
+    const uint8_t ok = llama_rs_keep_snapshots(n_rs_seq, ubatch.n_seq_tokens) ? 1 : 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; i += std::max<uint32_t>(1, ubatch.n_seq_tokens)) {
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            if (seq_id >= 0 && (uint32_t) seq_id < rs_snap_ok.size()) {
+                rs_snap_ok[seq_id] = ok;
+            }
+        }
+    }
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
@@ -1311,6 +1345,7 @@ bool llama_memory_recurrent_context::apply() {
     }
 
     mem->find_slot(ubatches[i_next]);
+    mem->note_rs_snapshots(ubatches[i_next]);
 
     return true;
 }

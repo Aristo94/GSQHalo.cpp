@@ -12,6 +12,13 @@
 // llama_memory_recurrent
 //
 
+// Whether a ubatch with n_seq_tokens tokens per sequence writes the n_rs_seq rollback snapshots of the recurrent
+// state. A rollback only ever undoes part of a verified draft, i.e. tokens of a short ubatch, so a large prefill
+// ubatch (more than LLAMA_RS_SNAPSHOT_MAX tokens per sequence, default 255, at least n_rs_seq + 1) keeps none and
+// the backend can run its chunked recurrence; the memory then refuses a rollback into that ubatch.
+// LLAMA_RS_SNAPSHOT_MAX=0 keeps the snapshots for every ubatch.
+bool llama_rs_keep_snapshots(uint32_t n_rs_seq, uint32_t n_seq_tokens);
+
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
@@ -75,6 +82,11 @@ public:
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+
+    // per-seq: the last ubatch wrote its rollback snapshots (see llama_rs_keep_snapshots)
+    std::vector<uint8_t> rs_snap_ok;
+
+    void note_rs_snapshots(const llama_ubatch & ubatch);
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
