@@ -11,7 +11,8 @@
 //
 // usage: test-kv-rows -m MODEL [common flags, e.g. -c 32768 -np 2 -fa on -ub 4096]; the cache is always unified
 // env:   KVR_N (prompt tokens, 8192), KVR_GEN (32), KVR_RUN (positions per run, 4096), KVR_CHUNK (512),
-//        KVR_MODE (single|interleaved)
+//        KVR_MODE (single|interleaved), KVR_RESTORE (rows|state: the control, a whole state of seq 0 instead of the
+//        rows - what any restore gives)
 
 #include "arg.h"
 #include "common.h"
@@ -94,6 +95,7 @@ int main(int argc, char ** argv) {
     const int  RUN   = env_int("KVR_RUN", 4096);
     const int  CHUNK = env_int("KVR_CHUNK", 512);
     const bool inter = getenv("KVR_MODE") && strcmp(getenv("KVR_MODE"), "interleaved") == 0;
+    const bool whole = getenv("KVR_RESTORE") && strcmp(getenv("KVR_RESTORE"), "state") == 0;
 
     llama_backend_init();
 
@@ -111,8 +113,8 @@ int main(int argc, char ** argv) {
     const bool          partial = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
     llama_memory_t      mem     = llama_get_memory(ctx);
 
-    fprintf(stderr, "kv-rows: mode %s, N %d, gen %d, run %d, chunk %d, row size %zu bytes, recurrent state %s\n",
-            inter ? "interleaved" : "single", N, G, RUN, CHUNK, row, partial ? "yes" : "no");
+    fprintf(stderr, "kv-rows: mode %s, restore %s, N %d, gen %d, run %d, chunk %d, row size %zu bytes, recurrent state %s\n",
+            inter ? "interleaved" : "single", whole ? "state" : "rows", N, G, RUN, CHUNK, row, partial ? "yes" : "no");
     if (row == 0) {
         fprintf(stderr, "kv-rows: FAIL - this context serves no rows (V transposed? -fa on)\n");
         return 1;
@@ -163,6 +165,14 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+    std::vector<uint8_t> full;
+    if (whole) {
+        full.resize(llama_state_seq_get_size_ext(ctx, 0, 0));
+        if (llama_state_seq_get_data_ext(ctx, full.data(), full.size(), 0, 0) != full.size()) {
+            fprintf(stderr, "kv-rows: FAIL - state get\n");
+            return 1;
+        }
+    }
     fprintf(stderr, "kv-rows: get_rows %.1f ms total (%.1f ms per %d positions), %.1f MiB rows, partial state %.1f MiB\n",
             t_get, t_get * RUN / N, RUN, (double) N * row / (1 << 20), (double) state.size() / (1 << 20));
 
@@ -183,8 +193,15 @@ int main(int argc, char ** argv) {
 
     // remove, allocate, write back
     llama_memory_seq_rm(mem, 0, -1, -1);
+    if (whole) {
+        if (llama_state_seq_set_data_ext(ctx, full.data(), full.size(), 0, 0) != full.size()) {
+            fprintf(stderr, "kv-rows: FAIL - state set\n");
+            return 1;
+        }
+        runs.clear();                               // nothing of the rows path to check
+    }
     t0 = std::chrono::steady_clock::now();
-    if (!llama_strix_kv_alloc(ctx, 0, P.data(), N)) {
+    if (!whole && !llama_strix_kv_alloc(ctx, 0, P.data(), N)) {
         fprintf(stderr, "kv-rows: FAIL - alloc\n");
         return 1;
     }
@@ -200,7 +217,7 @@ int main(int argc, char ** argv) {
         }
         t_set += ms_since(t0);
     }
-    if (partial && llama_state_seq_set_data_ext(ctx, state.data(), state.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != state.size()) {
+    if (!whole && partial && llama_state_seq_set_data_ext(ctx, state.data(), state.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != state.size()) {
         fprintf(stderr, "kv-rows: FAIL - partial state set\n");
         return 1;
     }
