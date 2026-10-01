@@ -2545,6 +2545,11 @@ extern "C" {
             struct ggml_tensor * top_k,
                      int64_t     n_kv_raw);
 
+    // largest n_kv of a selected-key op without a mask (the top_k rows alone carry the visibility): a graph may drop
+    // the mask only up to this size, and backend kernels for such ops must take every n_kv up to it. 2^24 also keeps
+    // cell indices exact when a selection graph routes them through F32.
+#define GGML_FLASH_ATTN_EXT_TOP_K_MAX_KV 16777216
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

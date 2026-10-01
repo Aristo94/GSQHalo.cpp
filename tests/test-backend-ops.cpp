@@ -9585,11 +9585,20 @@ struct test_flash_attn_ext_top_k : public test_case {
 struct test_qsa_prefill : public test_case {
     const int dim, queries, keys, selected, streams, ratio;
     const bool interleaved, poison;
+    bool spread = false;   // see qsa_spread()
     ggml_tensor * q = nullptr, * k = nullptr, * v = nullptr, * mask = nullptr, * ids = nullptr;
     test_qsa_prefill(int queries, int keys, int selected, bool interleaved=true, bool poison=false, int streams=1, int ratio=12, int dim=256)
         : dim(dim), queries(queries), keys(keys), selected(selected), streams(streams), ratio(ratio), interleaved(interleaved), poison(poison) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL"; }
-    std::string vars() override { return VARS_TO_STR8(dim,queries,keys,selected,streams,ratio,interleaved,poison); }
+    std::string vars() override { return VARS_TO_STR8(dim,queries,keys,selected,streams,ratio,interleaved,poison) + (spread ? ",spread=1" : ""); }
+    // the key of pick j of a query row; spread: the picks cover the whole key range, plus the last key and key 4*65535
+    // (block 65535, the 16-bit pad value of the old union) in every row
+    int pick(int j, int query, int stream) const {
+        if (!spread) return 1+(j*37+query*13+stream*7)%(keys-4);
+        if (j==2) return keys-1;
+        if (j==3) return std::min(keys-2,4*65535);
+        return 1+(int) (((int64_t) j*(keys-4)/selected+query*13+stream*7)%(keys-4));
+    }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -9613,7 +9622,7 @@ struct test_qsa_prefill : public test_case {
         std::vector<ggml_fp16_t> masks(ggml_nelements(mask),ggml_fp32_to_fp16(-INFINITY));
         for (int stream=0;stream<streams;++stream) for (int q=0;q<queries;++q) {
             for (int j=0;j<selected;++j) {
-                int key=1+(j*37+q*13+stream*7)%(keys-4);
+                int key=pick(j,q,stream);
                 if (key==3) key=4;
                 if (j==0) key=selected==1 ? 2 : (poison ? 3 : -1);
                 if (j==1) key=2;
@@ -9708,7 +9717,7 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
         std::vector<int32_t> picks(ggml_nelements(ids));
         for (int q=0;q<queries;++q) {
             for (int j=0;j<selected;++j) {
-                int key=1+(j*37+q*13)%(keys-4);
+                int key=pick(j,q,0);
                 if (j==0) key=selected==1 ? 2 : -1;      // -1: an invisible block's cell
                 if (j==1) key=2;
                 if (j>selected-3 && selected>4) key=-1;  // tail padding
@@ -9753,6 +9762,9 @@ struct test_qsa_decode_maskless : public test_qsa_prefill_maskless {
         : test_qsa_prefill_maskless(queries,keys,selected,ratio,interleaved) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_DECODE_MASKLESS"; }
 };
+
+// selected keys beyond 2^18 (a unified multi-slot cache): picks over the whole range, see test_qsa_prefill::pick
+template<typename T> static T * qsa_spread(T * t) { t->spread = true; return t; }
 
 // Complete-block selection as qwen4exp_select_complete_blocks builds it (512-block budget, ratio 4): the HIP
 // backend fuses the whole subgraph into one kernel; the CPU computes it node by node. Exact integer comparison.
@@ -13763,6 +13775,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_prefill(520,135168,2051));
     test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));
     test_cases.emplace_back(new test_qsa_prefill(640,4096,257,true,true));
+    // more than 262140 keys (two slots of a unified cache above 256K together): 32-bit union blocks in qsa_prefill.
+    // 640 queries read K/V directly (< keys/128 queries), 2052 / 3128 queries pack them first
+    for (int keys : {262400,400000}) {
+        test_cases.emplace_back(qsa_spread(new test_qsa_prefill(640,keys,2051)));
+        test_cases.emplace_back(qsa_spread(new test_qsa_prefill_maskless(640,keys,2051)));
+        test_cases.emplace_back(qsa_spread(new test_qsa_decode(8,keys,2051)));
+        test_cases.emplace_back(qsa_spread(new test_qsa_decode_maskless(64,keys,2051)));
+        test_cases.emplace_back(qsa_spread(new test_qsa_decode_maskless(9,keys,257,4)));   // SIMT kernel (GQA 4)
+    }
+    test_cases.emplace_back(qsa_spread(new test_qsa_prefill(2052,262400,257)));
+    test_cases.emplace_back(qsa_spread(new test_qsa_prefill_maskless(2052,262400,257)));
+    test_cases.emplace_back(qsa_spread(new test_qsa_prefill_maskless(3128,400000,257)));
     for (int n_blocks : {512, 700, 2048}) for (int n_query : {1, 3, 9, 64, 127, 130}) test_cases.emplace_back(new test_qsa_expand(n_blocks, n_query));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,4));
