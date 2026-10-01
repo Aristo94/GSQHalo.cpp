@@ -19,6 +19,10 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// disk tier: STRIX_STATE_HASH names states by their XXH3 (debugging only); inlined, nothing new to link
+#define XXH_INLINE_ALL
+#include "vendor/hash/xxhash/xxhash.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -379,6 +383,10 @@ struct server_slot {
                                          llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id));
             try {
                 end_ckpt.update_tgt(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (getenv("STRIX_STATE_HASH")) {
+                    SLT_INF(*this, "STATE_HASH end state as it leaves: %zu bytes, %016llx (%lld tokens)\n", end_ckpt.data_tgt.size(),
+                            (unsigned long long) XXH3_64bits(end_ckpt.data_tgt.data(), end_ckpt.data_tgt.size()), (long long) n_entry);
+                }
                 end_ckpt.update_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 common_speculative_get_state(spec, id, end_ckpt.data_spec);
                 end = &end_ckpt;
@@ -833,6 +841,17 @@ struct server_slot {
     }
 
     void print_timings_pp() const {
+        // STRIX_STATE_HASH: the slot's state after every prompt batch, to find the first batch where two runs part
+        // (debugging only)
+        if (getenv("STRIX_STATE_HASH") && prompt.n_tokens() > 0) {
+            for (const llama_state_seq_flags fl : { (llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, (llama_state_seq_flags) 0 }) {
+                std::vector<uint8_t> st(llama_state_seq_get_size_ext(ctx_tgt, id, fl));
+                llama_state_seq_get_data_ext(ctx_tgt, st.data(), st.size(), id, fl);
+                SLT_INF(*this, "STATE_HASH batch %s: %016llx at %d tokens\n", fl ? "recurrent" : "whole",
+                        (unsigned long long) XXH3_64bits(st.data(), st.size()), prompt.n_tokens());
+            }
+        }
+
         const double t_prompt_total = stats.t_prompt_ms();
 
         if (t_prompt_total < 3000.0) {
@@ -3418,13 +3437,16 @@ private:
                     res->id = task.id;
                     const int64_t t0 = ggml_time_us();
                     int n_saved = 0;
+                    int n_had   = 0;
                     int64_t n_tokens = 0;
                     if (prompt_cache && prompt_cache->has_disk()) {
                         for (auto & slot : slots) {
                             if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                                 continue;
                             }
-                            if (slot.prompt_save(*prompt_cache, /* ram = */ false, /* wait = */ true)) {
+                            if (prompt_cache->disk_covered(slot.prompt.tokens) >= slot.prompt.tokens.size()) {
+                                n_had++;                    // the store has all of it already
+                            } else if (slot.prompt_save(*prompt_cache, /* ram = */ false, /* wait = */ true)) {
                                 n_saved++;
                                 n_tokens += slot.prompt.n_tokens();
                             }
@@ -3433,8 +3455,9 @@ private:
                     } else {
                         res->success = true;
                     }
-                    res->message = string_format("%d conversations, %lld tokens, %.0f ms%s", n_saved, (long long) n_tokens,
-                                                 (ggml_time_us() - t0) / 1000.0, res->success ? "" : "; the writer did not finish in time");
+                    res->message = string_format("%d conversations written (%lld tokens), %d in the store already, %.0f ms%s",
+                                                 n_saved, (long long) n_tokens, n_had, (ggml_time_us() - t0) / 1000.0,
+                                                 res->success ? "" : "; the writer did not finish in time");
                     SRV_INF("persist: %s\n", res->message.c_str());
                     queue_results.send(std::move(res));
                 } break;
@@ -3930,6 +3953,17 @@ private:
                                 SLT_DBG(slot, "prompt token %3d: %6d '%s'\n", i, input_tokens[i], common_token_to_piece(ctx_tgt, input_tokens[i]).c_str());
                             }
                         }*/
+
+                        // STRIX_STATE_HASH: what the slot holds as a task starts - the recurrent part and the whole
+                        // state - to tell a restored conversation from a resident one (debugging only)
+                        if (getenv("STRIX_STATE_HASH") && slot.prompt.n_tokens() > 0) {
+                            for (const llama_state_seq_flags fl : { (llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, (llama_state_seq_flags) 0 }) {
+                                std::vector<uint8_t> st(llama_state_seq_get_size_ext(ctx_tgt, slot.id, fl));
+                                llama_state_seq_get_data_ext(ctx_tgt, st.data(), st.size(), slot.id, fl);
+                                SLT_INF(slot, "STATE_HASH %s: %zu bytes, %016llx (%d tokens)\n", fl ? "recurrent" : "whole", st.size(),
+                                        (unsigned long long) XXH3_64bits(st.data(), st.size()), slot.prompt.n_tokens());
+                            }
+                        }
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;

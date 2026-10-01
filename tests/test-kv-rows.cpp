@@ -144,8 +144,10 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "kv-rows: prompt decoded in %.0f ms\n", ms_since(t0));
 
-    // rows by run, then the recurrent state at N
+    // rows by run, then the recurrent state at N; the decodes are done first, so the timing is the reads' alone
+    llama_synchronize(ctx);
     std::vector<std::vector<uint8_t>> runs;
+    std::vector<double> t_runs;
     double t_get = 0;
     for (int p = 0; p < N; p += RUN) {
         const int n = std::min(RUN, N - p);
@@ -155,7 +157,15 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "kv-rows: FAIL - get_rows [%d, %d)\n", p, p + n);
             return 1;
         }
-        t_get += ms_since(t0);
+        t_runs.push_back(ms_since(t0));
+        t_get += t_runs.back();
+    }
+    {
+        std::string per;
+        for (double t : t_runs) {
+            per += " " + std::to_string((int) (t + 0.5));
+        }
+        fprintf(stderr, "kv-rows: get_rows per run (ms):%s\n", per.c_str());
     }
     std::vector<uint8_t> state;
     if (partial) {
