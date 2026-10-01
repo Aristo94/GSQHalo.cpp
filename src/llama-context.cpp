@@ -2724,9 +2724,43 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        // disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw): one device read per run of nearby
+        // pieces instead of one per piece. A sequence that was decoded alongside others sits interleaved with
+        // them, cell by cell, in a unified cache, so its state is thousands of cell ranges per layer, and a
+        // synchronous read per range stalls the whole server. Pieces of one tensor whose offsets rise with gaps
+        // of at most kGap bytes are read as one span (at most kSpan bytes) and cut on the host: the same bytes,
+        // in the same places.
+        constexpr size_t kGap  = (size_t) 1 << 20;
+        constexpr size_t kSpan = (size_t) 256 << 20;
+        std::vector<uint8_t> tmp;
+        size_t n_reads = 0;
+        size_t i = 0;
+        while (i < winfos.size()) {
+            const write_info & w0 = winfos[i];
+            size_t j   = i;
+            size_t end = w0.offset + w0.size;
+            while (j + 1 < winfos.size()) {
+                const write_info & w = winfos[j + 1];
+                if (w.tensor != w0.tensor || w.offset < end || w.offset - end > kGap || w.offset + w.size - w0.offset > kSpan) {
+                    break;
+                }
+                ++j;
+                end = w.offset + w.size;
+            }
+            if (j == i) {
+                ggml_backend_tensor_get(w0.tensor, w0.ptr, w0.offset, w0.size);
+            } else {
+                tmp.resize(end - w0.offset);
+                ggml_backend_tensor_get(w0.tensor, tmp.data(), w0.offset, tmp.size());
+                for (size_t k = i; k <= j; ++k) {
+                    memcpy(winfos[k].ptr, tmp.data() + (winfos[k].offset - w0.offset), winfos[k].size);
+                }
+            }
+            ++n_reads;
+            i = j + 1;
+        }
+        if (n_reads > 0) {
+            LLAMA_LOG_DEBUG("%s: %zu pieces in %zu device reads\n", __func__, winfos.size(), n_reads);
         }
     }
 
