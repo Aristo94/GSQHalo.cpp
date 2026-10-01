@@ -6239,6 +6239,70 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static void ggml_cuda_mmq_y_cache_release(ggml_backend_cuda_context & ctx) {
+    auto & yc = ctx.mmq_y_cache;
+    if (yc.ptr != nullptr) {
+        yc.pool->free(yc.ptr, yc.size);
+    }
+    yc = {};
+}
+
+// a dense MUL_MAT that ggml_cuda_mul_mat sends to MMQ with a Q8_1 src1 (no MMVQ, no MMB)
+static bool ggml_cuda_mmq_y_reader(ggml_backend_cuda_context & ctx, const ggml_tensor * node, const int cc) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    return node->op == GGML_OP_MUL_MAT && src0 && src1 && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+        node->type == GGML_TYPE_F32 && src1->ne[1] > MMVQ_MAX_BATCH_SIZE && !blackwell_mma_available(cc) &&
+        ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts =*/ 0) &&
+        !ggml_cuda_mmb_supported_mm(ctx, src0, src1, node);
+}
+
+// Dense projections of one activation (GDN qkv/gate, shared-expert up/gate, attention q/v) each quantize it to Q8_1.
+// At a reader node i, look ahead for later readers of the same tensor with the same Q8_1 layout, stopping at the first
+// node that writes into its memory; if there are any, the first MMQ reader keeps its Q8_1 copy in ctx.mmq_y_cache and
+// the others reuse it (same kernel, same input: bit-identical). Released after the last reader.
+// GGML_CUDA_MMQ_Y_REUSE=0 disables.
+static void ggml_cuda_mmq_y_cache_step(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = getenv("GGML_CUDA_MMQ_Y_REUSE") == nullptr || atoi(getenv("GGML_CUDA_MMQ_Y_REUSE")) != 0;
+    auto & yc = ctx.mmq_y_cache;
+    if (yc.src1 != nullptr && i > yc.last_reader) {
+        ggml_cuda_mmq_y_cache_release(ctx);
+    }
+    if (!enabled || yc.src1 != nullptr || ctx.curr_stream_no != 0) {
+        return;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!ggml_cuda_mmq_y_reader(ctx, node, cc)) {
+        return;
+    }
+    const ggml_tensor * src1 = node->src[1];
+    const mmq_q8_1_ds_layout ds_layout = mmq_get_q8_1_ds_layout(node->src[0]->type);
+    const char * y0 = (const char *) src1->data;
+    const char * y1 = y0 + ggml_nbytes(src1);
+
+    int last_reader = -1;
+    for (int k = i + 1; k < cgraph->n_nodes && k <= i + 64; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->src[1] == src1 && ggml_cuda_mmq_y_reader(ctx, n, cc) && mmq_get_q8_1_ds_layout(n->src[0]->type) == ds_layout) {
+            last_reader = k;
+            continue;
+        }
+        const char * d0 = (const char *) n->data;
+        if (d0 == nullptr || (d0 < y1 && y0 < d0 + ggml_nbytes(n))) {
+            break;
+        }
+    }
+    if (last_reader > i) {
+        yc.src1        = src1;
+        yc.ds_layout   = ds_layout;
+        yc.last_reader = last_reader;
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -6379,6 +6443,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_mmq_y_cache_step(*cuda_ctx, cgraph, i);
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip == GGML_CUDA_FUSED_SELF) {
@@ -6421,6 +6487,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            ggml_cuda_mmq_y_cache_release(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH

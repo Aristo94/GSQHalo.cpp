@@ -1509,6 +1509,18 @@ struct ggml_backend_cuda_context {
     // HC residuals whose remaining readers live in a later split of the same graph on this device: tensor -> uses left
     std::unordered_map<const ggml_tensor *, int> mmb_res16_pending;
 
+    // Q8_1 copy of a dense MMQ activation that later MUL_MAT nodes of the same graph read again (set up by
+    // ggml_cuda_mmq_y_cache_step): the first MMQ reader quantizes into it, the others reuse it bit-identically
+    struct {
+        const ggml_tensor * src1      = nullptr;
+        int               ds_layout   = -1;
+        int               last_reader = -1;
+        ggml_cuda_pool  * pool        = nullptr;
+        void            * ptr         = nullptr;
+        size_t            size        = 0;
+        size_t            nbytes      = 0; // bytes of quantized src1, 0 until the first reader filled the buffer
+    } mmq_y_cache;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

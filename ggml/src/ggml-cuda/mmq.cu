@@ -367,15 +367,36 @@ static void ggml_cuda_mul_mat_q_impl(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        const size_t nbytes_src1_q = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block;
+        const size_t nbytes_src1_q8_1 = nbytes_src1_q + ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        // src1 is read by later MMQ nodes with the same Q8_1 layout (ggml_cuda_mmq_y_cache_step): the first reader
+        // quantizes into the kept buffer, the others skip the quantization
+        auto & yc = ctx.mmq_y_cache;
+        const bool y_keep = !use_native_fp4 && !swiglu && ctx.curr_stream_no == 0 && yc.src1 == src1 &&
+            yc.ds_layout == (int) mmq_get_q8_1_ds_layout(src0->type);
+        bool y_reuse = false;
+        char * src1_q8_1_d = nullptr;
+        if (y_keep && yc.ptr != nullptr) {
+            y_reuse = yc.nbytes == nbytes_src1_q && yc.size >= nbytes_src1_q8_1;
+            src1_q8_1_d = y_reuse ? (char *) yc.ptr : src1_q8_1.alloc(nbytes_src1_q8_1);
+        } else if (y_keep) {
+            // pad for the largest J of any reader
+            const size_t size = std::max(nbytes_src1_q8_1, nbytes_src1_q + 512*sizeof(block_q8_1_mmq));
+            yc.pool   = &ctx.pool();
+            yc.ptr    = yc.pool->alloc(size, &yc.size);
+            yc.nbytes = nbytes_src1_q;
+            src1_q8_1_d = (char *) yc.ptr;
+        } else {
+            src1_q8_1_d = src1_q8_1.alloc(nbytes_src1_q8_1);
+        }
+
+        if (!y_reuse) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -383,17 +404,17 @@ static void ggml_cuda_mul_mat_q_impl(
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1_d, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else if (swiglu) {
                 quantize_mmq_q8_1_swiglu_cuda(
-                    (const float *) gate->data, (const float *) up->data, nullptr, src1_q8_1.get(), src0->type,
+                    (const float *) gate->data, (const float *) up->data, nullptr, src1_q8_1_d, src0->type,
                     ne10, ne10_padded, ne11 * ne12 * ne13, /*logical_n1=*/1,
                     gate->nb[1] / sizeof(float), gate->nb[1] / sizeof(float),
                     up->nb[1] / sizeof(float), up->nb[1] / sizeof(float), stream);
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -406,7 +427,7 @@ static void ggml_cuda_mul_mat_q_impl(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1_d, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,

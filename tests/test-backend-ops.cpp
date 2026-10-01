@@ -5736,6 +5736,62 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// dense MUL_MATs that read one activation (GDN qkv/gate, shared-expert up/gate, attention q/v with other nodes in
+// between): backends may quantize the activation once for all of them. inplace: a node between the first two readers
+// writes into the activation, so the third reader must not reuse anything quantized before it.
+struct test_mul_mat_shared_y : public test_case {
+    const std::array<ggml_type, 3> types;
+    const std::array<int64_t, 3> ms;
+    const int64_t n;
+    const int64_t k;
+    const bool mid_op;
+    const bool inplace;
+
+    std::string vars() override {
+        return VARS_TO_STR6(types, ms, n, k, mid_op, inplace);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_Y";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_shared_y(std::array<ggml_type, 3> types, std::array<int64_t, 3> ms, int64_t n, int64_t k,
+            bool mid_op = false, bool inplace = false)
+        : types(types), ms(ms), n(n), k(k), mid_op(mid_op), inplace(inplace) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < 3 && ms[i] > 0; ++i) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, types[i], k, ms[i]);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+            ggml_tensor * y = b;
+            if (inplace && i == 1) {
+                y = ggml_scale_inplace(ctx, b, 0.5f);
+                ggml_set_name(y, "b_scaled");
+            }
+            ggml_tensor * c = ggml_mul_mat(ctx, a, y);
+            ggml_set_name(c, ("c" + std::to_string(i)).c_str());
+            if (mid_op && i == 0) {
+                c = ggml_scale(ctx, c, 2.0f);
+            }
+            out = out ? ggml_concat(ctx, out, c, 0) : c;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_exact_batch : public test_case {
     const ggml_type type_a;
     const int64_t m;
@@ -12533,6 +12589,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 4, 2, false, 8,  1, 64, 1.0f, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 2, false, 8, 16, 64, 1.0f, 64));
 
+    // one activation, several dense MMQ readers: same / mixed Q8_1 layouts, nodes in between, in-place writer
+    for (int64_t n : {64, 300}) {
+        test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S}, {256, 128, 0}, n, 512));
+        test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K}, {128, 384, 0}, n, 512));
+        test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}, {256, 128, 64}, n, 512, true));
+        test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_S}, {128, 128, 256}, n, 512, true));
+        test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K}, {128, 128, 128}, n, 512, false, true));
+        test_cases.emplace_back(new test_mul_mat_shared_y({GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S}, {256, 256, 128}, n, 768, true, true));
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
     for (ggml_type type_a : all_types) {
