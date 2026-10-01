@@ -1407,5 +1407,9 @@ struct llm_graph_context {
             ggml_tensor * dense_3) const;
 };
 
+// qwen4exp MTP draft: an output-less ubatch of at least this many tokens (a prompt catch-up) builds only the
+// block's K/V store instead of the full block. LLAMA_MTP_KV_ONLY=<n> (default 64), 0 = always the full block.
+int32_t llama_mtp_kv_only_min();
+
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);

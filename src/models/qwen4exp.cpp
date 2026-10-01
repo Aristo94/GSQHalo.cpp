@@ -454,8 +454,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h = inp->h;
     res->add_input(std::move(inp));
 
+    // A catch-up ubatch (prompt or accepted tokens) wants no row out of the draft: what it leaves behind for later
+    // drafts is this block's K/V (and indexer keys) in the draft cache, and those depend on nothing past the
+    // attention input. So it skips the attention itself, the FFN, the final mixer and the LM head. Small ubatches
+    // keep the full block: they commit the incremental QSA key cache that the drafts after them read fast.
+    // LLAMA_MTP_KV_ONLY=<min ubatch tokens>, 0 = always the full block (see llama_mtp_kv_only_min; the context
+    // reserves its compute buffers for this split, see llama_context::mtp_full_reserve_tokens).
+    const int kv_only_min = llama_mtp_kv_only_min();
+    const bool kv_only = kv_only_min > 0 && n_outputs == 0 && n_tokens >= kv_only_min;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
     // The draft block is the only layer in an MTP context. With an indexer the context holds a hybrid-idx
     // memory (create_memory) and the block runs the trunk's sparse attention; otherwise a plain attention input.
     llm_graph_input_attn_kv * inp_attn = nullptr;
@@ -488,14 +497,33 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // fc_embedding(e) + fc_hidden(h) is one projection of the concatenation; the converter
     // merges the two checkpoint tensors into this single eh_proj
-    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj,
-            ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0);   // [2*n_embd, hc, n_tokens]
+
+    // A catch-up ubatch projects as one GEMM over the hc*n_tokens rows: the 3-D input is a batch of n_tokens
+    // hc-column products, which the backends run as n_tokens matrix-vector passes over the whole weight (~140 ms
+    // per 8192 tokens). The draft steps keep the 3-D form and with it their numerics. LLAMA_MTP_EH_GEMM=0: 3-D always.
+    static const bool eh_gemm = [] {
+        const char * env = getenv("LLAMA_MTP_EH_GEMM");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    ggml_tensor * inpL = nullptr;
+    if (eh_gemm && kv_only) {
+        inpL = build_lora_mm(layer.nextn.eh_proj, ggml_reshape_2d(ctx0, eh_in, 2*n_embd, hc*n_tokens), layer.nextn.eh_proj_s);
+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
+    } else {
+        inpL = build_lora_mm(layer.nextn.eh_proj, eh_in, layer.nextn.eh_proj_s);
+    }
     cb(inpL, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur    = build_hc_mix(inpL,
             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
+
+    if (kv_only) {
+        build_layer_attn_store_kv(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
+        return;
+    }
 
     // sparse attention for the draft when its context carries an indexer cache (the sidecar ships the
     // block's indexer projections and the trunk's compress ratio is inherited at load), else dense
@@ -1547,6 +1575,57 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(cur, "attn_output", il);
 
     return cur;
+}
+
+// The K/V half of build_layer_attn, same ops in the same order: project, normalize and rotate this ubatch's keys
+// and values and store them (and the raw indexer keys) in the cache, without attending.
+void llama_model_qwen4exp::graph::build_layer_attn_store_kv(
+        llm_graph_input_attn_kv * inp,
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+
+    if (mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0) {
+        build_qsa_store_k(mctx_hyb, cur, il);
+    }
+
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "Vcur", il);
+
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "Kcur_normed", il);
+
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+    Kcur = ggml_rope_multi(
+            ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow
+            );
+
+    cb(Kcur, "Kcur", il);
+    cb(Vcur, "Vcur", il);
+
+    if (inp->self_k_rot) {
+        Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+    }
+
+    // expand k last so that rope can fuse with the store into the cache, as in build_attn
+    ggml_build_forward_expand(gf, Vcur);
+    ggml_build_forward_expand(gf, Kcur);
+
+    ggml_build_forward_expand(gf, inp->mctx->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, inp->mctx->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(

@@ -259,6 +259,10 @@ public:
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
+    // a qwen4exp MTP draft builds only a K/V store for large output-less ubatches: the token count at which to
+    // reserve its full block, the large ubatch being reserved without outputs (0 = reserve as usual)
+    uint32_t mtp_full_reserve_tokens(uint32_t n_tokens) const;
+
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:

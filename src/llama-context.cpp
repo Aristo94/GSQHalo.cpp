@@ -701,7 +701,13 @@ void llama_context::sched_reserve() {
     int n_inputs_tg        = -1;
     int n_input_tensors_tg = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    // A qwen4exp MTP draft runs its full block only below llama_mtp_kv_only_min() tokens (draft steps, verification
+    // catch-ups); a larger output-less ubatch (a prompt catch-up) stores K/V and nothing else. Reserve those two
+    // instead of the full block at n_ubatch, whose sparse-attention selection grows with the context (draft compute
+    // buffers at -ub 2048: 2.8 GiB for a 512K context, 0.5 GiB this way, independent of the context).
+    // A full block over more tokens (LLAMA_MTP_KV_ONLY=0) grows the buffers when it first runs.
+    const uint32_t n_mtp_full   = mtp_full_reserve_tokens(n_tokens);
+    const uint32_t n_outputs_pp = n_mtp_full > 0 ? 0 : std::min(n_tokens, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -723,6 +729,18 @@ void llama_context::sched_reserve() {
         n_nodes_pp         = ggml_graph_n_nodes(gf);
         n_inputs_pp        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_pp = this->n_input_tensors;
+    }
+
+    if (n_mtp_full > 0) {
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        auto * gf = graph_reserve(n_mtp_full, n_seqs, n_seqs, mctx.get(),
+                model.hparams.no_alloc, model.hparams.no_alloc ? sizes.data() : nullptr);
+        if (!gf) {
+            throw std::runtime_error("failed to allocate compute buffers for the MTP block");
+        }
+        for (size_t i = 0; i < sizes.size() && model.hparams.no_alloc; ++i) {
+            backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes[i]);
+        }
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -923,9 +941,13 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+        const uint32_t n_mtp_full    = mtp_full_reserve_tokens(n_tokens);
+        const uint32_t n_outputs_max = n_mtp_full > 0 ? 0 : std::min(n_tokens, cparams.n_outputs_max);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        if (gf && n_mtp_full > 0) {
+            gf = graph_reserve(n_mtp_full, n_seqs, n_seqs, mctx.get());
+        }
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -2559,10 +2581,18 @@ static void ubatch_prepare_reserve(
     }
 }
 
+uint32_t llama_context::mtp_full_reserve_tokens(uint32_t n_tokens) const {
+    const int32_t n_min = llama_mtp_kv_only_min();
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || model.arch != LLM_ARCH_QWEN4EXP || n_min <= 0 || n_tokens < (uint32_t) n_min) {
+        return 0;
+    }
+    return (uint32_t) n_min;
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    GGML_ASSERT(n_outputs >= 1 || mtp_full_reserve_tokens(n_tokens) > 0);
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs

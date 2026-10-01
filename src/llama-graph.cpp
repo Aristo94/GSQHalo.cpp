@@ -3964,6 +3964,14 @@ void llm_graph_context::build_sampling() const {
     */
 }
 
+int32_t llama_mtp_kv_only_min() {
+    static const int32_t n_min = [] {
+        const char * env = getenv("LLAMA_MTP_KV_ONLY");
+        return env ? (int32_t) atoi(env) : (int32_t) 64;
+    }();
+    return n_min;
+}
+
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
     // TODO move to hparams if a T5 variant appears that uses a different value
     const int64_t max_distance = 128;
