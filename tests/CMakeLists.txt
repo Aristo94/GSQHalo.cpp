@@ -154,6 +154,7 @@ llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 llama_build(test-save-load-state.cpp)
+llama_build(test-kv-rows.cpp) # llama_strix_kv_* round trip, needs a model: -m MODEL (-fa on -kvu)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)

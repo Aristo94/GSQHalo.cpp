@@ -1241,6 +1241,224 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+//
+// disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw): rows by position (llama_strix_kv_*)
+//
+
+size_t llama_kv_cache::row_size() const {
+    if (v_trans || n_stream != 1 || other) {
+        return 0;
+    }
+
+    size_t res = 0;
+    for (const auto & layer : layers) {
+        res += ggml_row_size(layer.k_stream[0]->type, hparams.n_embd_k_gqa(layer.il));
+        if (layer.v_stream[0]) {
+            res += ggml_row_size(layer.v_stream[0]->type, hparams.n_embd_v_gqa(layer.il));
+        }
+    }
+
+    return res;
+}
+
+bool llama_kv_cache::seq_row_cells(llama_seq_id seq_id, llama_pos p0, uint32_t n, bool own, std::vector<std::pair<uint32_t, uint32_t>> & runs) const {
+    runs.clear();
+
+    if (row_size() == 0 || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p0 < 0) {
+        return false;
+    }
+
+    const auto & cells = v_cells[0];
+    const auto & pc    = cells.seq_pos_cells(seq_id);
+
+    // a text token's cell carries its position in both spatial slots when the batch had M-RoPE sections
+    // (llama_batch_allocr broadcasts it; the qwen4exp indexer takes the attention cache's batch), none otherwise;
+    // anything else is an image's, which the rows alone cannot bring back
+
+    // why a range is refused, the first few times in the process: the caller only learns that it was
+    static int n_warn = 0;
+    auto refuse = [&](const char * why, llama_pos pos, uint32_t c) {
+        if (n_warn < 8) {
+            ++n_warn;
+            LLAMA_LOG_WARN("%s: %s: rows [%d, %d) of seq %d refused at position %d (cell %u): %s\n", __func__,
+                    layers.empty() ? "" : ggml_get_name(layers[0].k), p0, p0 + (llama_pos) n, seq_id, pos, c, why);
+        }
+        return false;
+    };
+
+    llama_pos next = p0;
+    for (auto it = pc.lower_bound({ p0, 0 }); it != pc.end() && it->first < p0 + (llama_pos) n; ++it) {
+        const uint32_t c = it->second;
+        if (it->first != next) {
+            return refuse(it->first < next ? "two cells at one position" : "a position with no cell", next, c);
+        }
+        if (own && cells.seq_get_all(c).count() != 1) {
+            return refuse("a cell shared with another sequence", it->first, c);
+        }
+        if (has_cell_ext()) {
+            const llama_kv_cell_ext & ext = cells.ext_get(c);
+            if (ext.x != ext.y || (ext.x != 0 && ext.x != it->first)) {
+                return refuse("not a plain text token's cell", it->first, c);
+            }
+        }
+        if (!runs.empty() && runs.back().second == c) {
+            runs.back().second++;
+        } else {
+            runs.emplace_back(c, c + 1);
+        }
+        ++next;
+    }
+
+    return next == p0 + (llama_pos) n || refuse("the sequence ends before the range", next, 0);
+}
+
+bool llama_kv_cache::seq_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n, uint8_t * dst) const {
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    if (!seq_row_cells(seq_id, p0, n, false, runs)) {
+        return false;
+    }
+
+    // a sequence decoded alongside others sits interleaved with them in a unified cache: runs of rising cells at
+    // most kGap bytes apart are read as one span (at most kSpan bytes) and cut on the host, as llama_io_write_host does
+    constexpr size_t kGap  = (size_t) 1 << 20;
+    constexpr size_t kSpan = (size_t) 256 << 20;
+    std::vector<uint8_t> tmp;
+
+    size_t off = 0;
+    for (int kv = 0; kv < 2; ++kv) {
+        for (const auto & layer : layers) {
+            ggml_tensor * t = kv == 0 ? layer.k_stream[0] : layer.v_stream[0];
+            if (t == nullptr) {
+                continue;
+            }
+            const size_t row = ggml_row_size(t->type, kv == 0 ? hparams.n_embd_k_gqa(layer.il) : hparams.n_embd_v_gqa(layer.il));
+            for (size_t i = 0; i < runs.size(); ) {
+                size_t j = i;
+                while (j + 1 < runs.size() && runs[j + 1].first >= runs[j].second &&
+                       (size_t) (runs[j + 1].first - runs[j].second) * row <= kGap &&
+                       (size_t) (runs[j + 1].second - runs[i].first) * row <= kSpan) {
+                    ++j;
+                }
+                if (j == i) {
+                    const size_t size = (size_t) (runs[i].second - runs[i].first) * row;
+                    ggml_backend_tensor_get(t, dst + off, (size_t) runs[i].first * row, size);
+                    off += size;
+                } else {
+                    tmp.resize((size_t) (runs[j].second - runs[i].first) * row);
+                    ggml_backend_tensor_get(t, tmp.data(), (size_t) runs[i].first * row, tmp.size());
+                    for (size_t k = i; k <= j; ++k) {
+                        const size_t size = (size_t) (runs[k].second - runs[k].first) * row;
+                        memcpy(dst + off, tmp.data() + (size_t) (runs[k].first - runs[i].first) * row, size);
+                        off += size;
+                    }
+                }
+                i = j + 1;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::seq_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n, const uint8_t * src, uint32_t src_rows) {
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    if (n > src_rows || !seq_row_cells(seq_id, p0, n, true, runs)) {
+        return false;
+    }
+
+    size_t off = 0;
+    for (int kv = 0; kv < 2; ++kv) {
+        for (const auto & layer : layers) {
+            ggml_tensor * t = kv == 0 ? layer.k_stream[0] : layer.v_stream[0];
+            if (t == nullptr) {
+                continue;
+            }
+            const size_t row = ggml_row_size(t->type, kv == 0 ? hparams.n_embd_k_gqa(layer.il) : hparams.n_embd_v_gqa(layer.il));
+            size_t o = off;
+            for (const auto & r : runs) {
+                const size_t size = (size_t) (r.second - r.first) * row;
+                ggml_backend_tensor_set(t, src + o, (size_t) r.first * row, size);
+                o += size;
+            }
+            off += (size_t) src_rows * row;         // the source's block for this layer holds src_rows rows
+        }
+    }
+
+    return true;
+}
+
+uint32_t llama_kv_cache::n_pos_per_embd() const {
+    return hparams.n_pos_per_embd();
+}
+
+bool llama_kv_cache::seq_alloc(llama_seq_id seq_id, const llama_token * tokens, uint32_t n, uint32_t n_pos, const slot_info * sinfo_in,
+                               slot_info * sinfo_out) {
+    if (row_size() == 0 || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    seq_rm(seq_id, -1, -1);
+
+    if (sinfo_out) {
+        *sinfo_out = {};
+    }
+    if (n == 0) {
+        return true;
+    }
+
+    auto & cells = v_cells[0];
+
+    n_pos = std::max(1u, n_pos);
+    llama_batch_allocr balloc(n_pos);
+    llama_ubatch ubatch = balloc.ubatch_reserve(n, 1);
+
+    ubatch.seq_id_unq[0] = seq_id;
+
+    // as a text batch comes in: the position in every M-RoPE section, the token id for the cell's ext
+    for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t j = 0; j < n_pos; ++j) {
+            ubatch.pos[j*n + i] = (llama_pos) i;
+        }
+        ubatch.token[i]    = tokens ? tokens[i] : LLAMA_TOKEN_NULL;
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i]   = &seq_id;
+    }
+
+    slot_info sinfo;
+    if (sinfo_in) {
+        // a mirrored cache takes the other's cells, which must be free here too
+        if (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != n) {
+            return false;
+        }
+        sinfo = *sinfo_in;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t idx = sinfo.idxs[0][i];
+            if (idx >= cells.size() || !cells.is_empty(idx)) {
+                LLAMA_LOG_ERROR("%s: cell %u of the mirrored layout is not free\n", __func__, idx);
+                return false;
+            }
+        }
+    } else {
+        // one run if there is one: the rows then go in and come out in one piece per layer
+        sinfo = find_slot(ubatch, true);
+        if (sinfo.empty()) {
+            sinfo = find_slot(ubatch, false);
+        }
+        if (sinfo.empty()) {
+            LLAMA_LOG_ERROR("%s: failed to find %u available cells\n", __func__, n);
+            return false;
+        }
+    }
+
+    apply_ubatch(sinfo, ubatch);
+
+    if (sinfo_out) {
+        *sinfo_out = sinfo;
+    }
+
+    return true;
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {

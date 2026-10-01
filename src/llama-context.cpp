@@ -4024,6 +4024,61 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
     return ctx->n_threads_batch();
 }
 
+//
+// disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw): rows by position
+// the qwen4exp memory (attention + indexer + recurrent), or a plain KV cache (no indexer, no recurrent state),
+// which keeps the API testable with a small attention-only model
+//
+
+size_t llama_strix_kv_row_size(const llama_context * ctx) {
+    const auto * mem = ctx ? ctx->get_memory() : nullptr;
+    if (const auto * idx = dynamic_cast<const llama_memory_hybrid_idx *>(mem)) {
+        return idx->kv_row_size();
+    }
+    if (const auto * kv = dynamic_cast<const llama_kv_cache *>(mem)) {
+        return kv->row_size();
+    }
+    return 0;
+}
+
+bool llama_strix_kv_get_rows(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, void * dst, size_t size) {
+    const size_t row = llama_strix_kv_row_size(ctx);
+    if (row == 0 || n < 0 || dst == nullptr || size != (size_t) n*row) {
+        return false;
+    }
+    ctx->synchronize();                             // the graphs that wrote these rows may still be running
+    const auto * mem = ctx->get_memory();
+    if (const auto * idx = dynamic_cast<const llama_memory_hybrid_idx *>(mem)) {
+        return idx->kv_rows_get(seq_id, p0, (uint32_t) n, (uint8_t *) dst);
+    }
+    return dynamic_cast<const llama_kv_cache *>(mem)->seq_rows_get(seq_id, p0, (uint32_t) n, (uint8_t *) dst);
+}
+
+bool llama_strix_kv_alloc(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n) {
+    if (llama_strix_kv_row_size(ctx) == 0 || n < 0) {
+        return false;
+    }
+    ctx->synchronize();
+    auto * mem = ctx->get_memory();
+    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        return idx->kv_alloc(seq_id, tokens, (uint32_t) n);
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    return kv->seq_alloc(seq_id, tokens, (uint32_t) n, kv->n_pos_per_embd(), nullptr, nullptr);
+}
+
+bool llama_strix_kv_set_rows(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, const void * src, int32_t src_rows) {
+    if (llama_strix_kv_row_size(ctx) == 0 || n < 0 || src_rows < n || src == nullptr) {
+        return false;
+    }
+    ctx->synchronize();
+    auto * mem = ctx->get_memory();
+    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        return idx->kv_rows_set(seq_id, p0, (uint32_t) n, (const uint8_t *) src, (uint32_t) src_rows);
+    }
+    return dynamic_cast<llama_kv_cache *>(mem)->seq_rows_set(seq_id, p0, (uint32_t) n, (const uint8_t *) src, (uint32_t) src_rows);
+}
+
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
 }

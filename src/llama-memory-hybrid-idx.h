@@ -78,6 +78,15 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw): a sequence's attention rows by position, for the server's disk tier
+    // (llama_strix_kv_*): the attention cache's rows, then the indexer's. The recurrent state is not in them - it is
+    // one per sequence, and goes through a LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY state (a context checkpoint)
+    size_t kv_row_size() const;
+    bool   kv_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n, uint8_t * dst) const;
+    bool   kv_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n, const uint8_t * src, uint32_t src_rows);
+    // seq_id loses everything it held and gets attention and indexer cells for positions [0, n) of `tokens`
+    bool   kv_alloc(llama_seq_id seq_id, const llama_token * tokens, uint32_t n);
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to

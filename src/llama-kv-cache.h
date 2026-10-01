@@ -168,6 +168,12 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+private:
+    // the cells of positions [p0, p0 + n) of seq_id as runs of consecutive cells, in position order (seq_rows_*)
+    bool seq_row_cells(llama_seq_id seq_id, llama_pos p0, uint32_t n, bool own, std::vector<std::pair<uint32_t, uint32_t>> & runs) const;
+
+public:
+
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
@@ -178,6 +184,24 @@ public:
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
     const slot_info_vec_t *   sinfos_in);
+
+    // disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw): a sequence's rows by position (llama_strix_kv_*). A range of n positions
+    // is laid out as a state's data is, without its headers: every layer's K rows for the n positions, then every
+    // layer's V rows. row_size() is the bytes one position takes, 0 when this cache cannot serve rows (V transposed,
+    // several streams, cells shared with another cache).
+    size_t row_size() const;
+    // the rows of positions [p0, p0 + n) of seq_id into dst; false when a position has no cell of its own or more
+    // than one, or its cell is not a plain text token's (an image under M-RoPE)
+    bool   seq_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n, uint8_t * dst) const;
+    // the same the other way; src is laid out for src_rows positions, of which the first n go in
+    bool   seq_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n, const uint8_t * src, uint32_t src_rows);
+    // seq_id loses its cells and gets cells for positions [0, n), as text tokens `tokens`, with no data yet: in one
+    // run if the cache has one, else wherever cells are free, unless sinfo_in gives a mirrored cache the other's layout
+    // n_pos: the position sections the text batch carried - the owner's, so that a cache mirroring another one (the
+    // qwen4exp indexer, one section of its own) gets the cell ext its cells get in a decode
+    bool   seq_alloc(llama_seq_id seq_id, const llama_token * tokens, uint32_t n, uint32_t n_pos, const slot_info * sinfo_in,
+                     slot_info * sinfo_out);
+    uint32_t n_pos_per_embd() const;
 
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);

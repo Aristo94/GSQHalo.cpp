@@ -332,6 +332,54 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
+// disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw)
+
+size_t llama_memory_hybrid_idx::kv_row_size() const {
+    const size_t attn = get_mem_attn()->row_size();
+    const size_t idx  = mem_idx ? mem_idx->row_size() : 0;
+    return attn == 0 || (mem_idx && idx == 0) ? 0 : attn + idx;
+}
+
+bool llama_memory_hybrid_idx::kv_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n, uint8_t * dst) const {
+    if (kv_row_size() == 0) {
+        return false;
+    }
+    return get_mem_attn()->seq_rows_get(seq_id, p0, n, dst) &&
+           (!mem_idx || mem_idx->seq_rows_get(seq_id, p0, n, dst + (size_t) n*get_mem_attn()->row_size()));
+}
+
+bool llama_memory_hybrid_idx::kv_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n, const uint8_t * src, uint32_t src_rows) {
+    if (kv_row_size() == 0) {
+        return false;
+    }
+    return get_mem_attn()->seq_rows_set(seq_id, p0, n, src, src_rows) &&
+           (!mem_idx || mem_idx->seq_rows_set(seq_id, p0, n, src + (size_t) src_rows*get_mem_attn()->row_size(), src_rows));
+}
+
+bool llama_memory_hybrid_idx::kv_alloc(llama_seq_id seq_id, const llama_token * tokens, uint32_t n) {
+    if (kv_row_size() == 0) {
+        return false;
+    }
+
+    // the recurrent state goes too: the caller restores the one for position n next
+    seq_rm(seq_id, -1, -1);
+    // the incremental QSA block keys of these cells were never computed here: rebuild them (qsa_recover)
+    qsa_invalidate();
+
+    // the indexer mirrors the attention cache cell for cell, as a restore does (state_read)
+    // both with the attention cache's position sections, as a decode gives both the one batch
+    const uint32_t n_pos = get_mem_attn()->n_pos_per_embd();
+    llama_kv_cache::slot_info sinfo;
+    if (!get_mem_attn()->seq_alloc(seq_id, tokens, n, n_pos, nullptr, &sinfo)) {
+        return false;
+    }
+    if (mem_idx && !mem_idx->seq_alloc(seq_id, tokens, n, n_pos, n > 0 ? &sinfo : nullptr, nullptr)) {
+        get_mem_attn()->seq_rm(seq_id, -1, -1);
+        return false;
+    }
+    return true;
+}
+
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,

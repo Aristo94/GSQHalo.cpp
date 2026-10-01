@@ -1120,6 +1120,22 @@ extern "C" {
     // Get the number of threads used for prompt and batch processing (multiple token).
     LLAMA_API int32_t llama_n_threads_batch(struct llama_context * ctx);
 
+    // disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw): a sequence's attention rows by position, so a server can move a conversation to
+    // disk and back a stretch of positions at a time instead of as one state. A position's row is every attention-type
+    // cache's (the KV cache, the sparse-attention indexer) every layer's K and V for that position; a range of n
+    // positions is laid out per cache, and within it per layer, as a state's data is. The recurrent state is not in the
+    // rows: it is one per sequence, and goes through llama_state_seq_*_ext with LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY.
+    // llama_strix_kv_row_size is 0 for a context that cannot serve rows (another memory, V transposed, several streams).
+    LLAMA_API size_t llama_strix_kv_row_size(const struct llama_context * ctx);
+    // the rows of positions [p0, p0 + n) of seq_id into dst (n * row size bytes). False when a position has no cell
+    // or more than one, or its cell is not a plain text token's
+    LLAMA_API bool llama_strix_kv_get_rows(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, void * dst, size_t size);
+    // seq_id loses whatever it held and gets cells for positions [0, n) of tokens, with no data yet
+    LLAMA_API bool llama_strix_kv_alloc(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n);
+    // rows into positions [p0, p0 + n) of cells llama_strix_kv_alloc made; src is laid out for src_rows positions,
+    // of which the first n are used
+    LLAMA_API bool llama_strix_kv_set_rows(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, const void * src, int32_t src_rows);
+
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
