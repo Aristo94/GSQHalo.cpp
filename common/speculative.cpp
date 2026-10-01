@@ -1613,6 +1613,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.size();
 
+        // LLAMA_MTP_TIMING=1: log where the time of a catch-up call goes (synchronizes both contexts)
+        static const bool mtp_timing = [] { const char * e = std::getenv("LLAMA_MTP_TIMING"); return e && std::atoi(e) != 0; }();
+        const int64_t t_beg_us = mtp_timing ? ggml_time_us() : 0;
+        int64_t t_sync_us = 0, t_batch_us = 0, t_dft_us = 0;   // sync: timestamp, batch/dft: summed durations
+        if (mtp_timing) {
+            llama_synchronize(this->params.ctx_tgt);
+            t_sync_us = ggml_time_us();
+        }
+
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
@@ -1635,8 +1644,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
-            batch.clear();
-
             // pair each token with the tgt embedding shifted right by one position, and
             // the first token of each sequence with the pending embedding from a previous run
             // assumes that the tokens in the batch are sequential for each sequence
@@ -1645,47 +1652,67 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
-
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
-
-                const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
-                    : h_tgt + (size_t) (k - 1) * n_embd;
-
-                batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
-            }
-
             auto * mem_dft = llama_get_memory(ctx_dft);
 
-            bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
+            // A long catch-up goes to the draft one micro-batch at a time: the batch holds a copy of every h row
+            // (40 KB per token for qwen4exp), and so does the draft's batch allocator, so a whole 32K prompt chunk
+            // would keep ~2.7 GB of host memory. Chained heads re-run the whole batch per head, so they take it at once.
+            const int32_t n_chunk = chain_heads ? n_tokens : std::max<int32_t>(1, (int32_t) llama_n_ubatch(ctx_dft));
+
+            for (int32_t k0 = 0; k0 < n_tokens; k0 += n_chunk) {
+                const int32_t k1 = std::min(n_tokens, k0 + n_chunk);
+
+                const int64_t t_fill_us = mtp_timing ? ggml_time_us() : 0;
+
+                batch.clear();
+                for (int k = k0; k < k1; ++k) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+
+                    const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+
+                    const float * h_row = k == i_batch_beg[seq_id]
+                        ? pending_h[seq_id].data()
+                        : h_tgt + (size_t) (k - 1) * n_embd;
+
+                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                }
+
+                const int64_t t_run_us = mtp_timing ? ggml_time_us() : 0;
+
+                bool ok = true;
+                for (int head = 0; head < n_mtp_layers; ++head) {
+                    if (chain_heads) {
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                            if (i_batch_beg[seq_id] < 0) {
+                                continue;
+                            }
+                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        llama_set_nextn_layer_offset(ctx_dft, head);
                     }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
+
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[k0].pos[0]);
+                        ok = false;
+                        break;
+                    }
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
-                    break;
+                if (chain_heads) {
+                    llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
                 }
-            }
-
-            if (chain_heads) {
-                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
-            }
-            if (!ok) {
-                return false;
+                if (!ok) {
+                    return false;
+                }
+                if (mtp_timing) {
+                    llama_synchronize(ctx_dft);
+                    const int64_t t_done_us = ggml_time_us();
+                    t_batch_us += t_run_us  - t_fill_us;
+                    t_dft_us   += t_done_us - t_run_us;
+                }
             }
         }
 
@@ -1694,17 +1721,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            // accept() picks the row of the last accepted draft token, which only a verification batch has; of a
+            // prompt chunk keep just its last row (copying all of them costs ~40 KB per token)
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            const int32_t n_keep = n_rows <= 512 ? n_rows : 1;
+            const int32_t i_beg  = i_batch_end[seq_id] - n_keep + 1;
+            verify_h_rows[seq_id] = n_keep;
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+            for (int32_t i = 0; i < n_keep; ++i) {
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_beg + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    verify_h[seq_id].data() + (size_t) (n_keep - 1) * n_embd, row_bytes);
+        }
+
+        if (mtp_timing) {
+            const int64_t t_end_us = ggml_time_us();
+            SPC_WRN("mtp-timing: n_tokens=%d sync_tgt=%.2f batch=%.2f draft=%.2f rest=%.2f total=%.2f ms\n",
+                    n_tokens, (t_sync_us - t_beg_us)/1e3, t_batch_us/1e3, t_dft_us/1e3,
+                    (t_end_us - t_sync_us - t_batch_us - t_dft_us)/1e3, (t_end_us - t_beg_us)/1e3);
         }
 
         return true;
@@ -2666,6 +2704,24 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // STRIX_SPEC_DRAFT_UBATCH=<n> caps the draft context's micro-batch, 0 = inherit the target's; default 2048 for
+    // a qwen4exp MTP draft. Its large ubatches are prompt catch-ups that store K/V and nothing else (see qwen4exp
+    // graph_mtp), which a smaller ubatch does not slow down, while its compute buffer and the host-side catch-up
+    // chunk shrink with it (n_ubatch * 40 KB per buffer of hidden states).
+    const char * fn = __func__;
+    auto cap_draft_ubatch = [&](const llama_model * model_dft) {
+        char arch[64] = {0};
+        llama_model_meta_val_str(model_dft, "general.architecture", arch, sizeof(arch));
+        int32_t cap = spec_mtp && std::strcmp(arch, "qwen4exp") == 0 ? 2048 : 0;
+        if (const char * e = std::getenv("STRIX_SPEC_DRAFT_UBATCH")) {
+            cap = std::atoi(e);
+        }
+        if (cap > 0 && (uint32_t) cap < cparams.n_ubatch) {
+            LOG_INF("%s: capping draft ubatch %u -> %d\n", fn, cparams.n_ubatch, cap);
+            cparams.n_ubatch = cap;
+        }
+    };
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
@@ -2684,6 +2740,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        cap_draft_ubatch(model_dft);
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
@@ -2696,6 +2753,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 
+        cap_draft_ubatch(model_tgt);
         llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
