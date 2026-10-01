@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -310,7 +311,21 @@ struct server_slot {
             }
             return n;
         };
-        // while the conversation grows, most rounds have no full run to hand over: say so before looking at its tokens
+        // the runs hold only as far as the prompt still starts with the tokens they were written for: a rewind that
+        // took another turn, a context shift, a reused cache chunk, another conversation in the slot - wherever it
+        // differs, they are cut there. In place, every round a slot is busy: one memcmp while nothing changed.
+        {
+            const size_t lim = std::min((size_t) prompt.n_tokens(), runs.tokens.size());
+            const llama_token * cur = &prompt.tokens[0];
+            size_t same = lim;
+            if (lim > 0 && memcmp(cur, runs.tokens.data(), lim * sizeof(llama_token)) != 0) {
+                same = (size_t) (std::mismatch(cur, cur + lim, runs.tokens.data()).first - cur);
+            }
+            if (same < runs.tokens.size()) {
+                runs_truncate((llama_pos) same);
+            }
+        }
+        // while the conversation grows, most rounds have no full run to hand over: say so before copying its tokens
         if (!leaving) {
             const int64_t have = ctx_dft ? std::min(cover(runs.tgt), cover(runs.dft)) : cover(runs.tgt);
             if (prompt.n_tokens() < have + cache.disk_run) {
@@ -325,15 +340,6 @@ struct server_slot {
         }
         if (cache.runs_lost(id)) {
             runs = {};                              // the store lost a run of ours: start over
-        }
-        // the runs hold only as far as the prompt still starts with the tokens they were written for: a rewind that
-        // took another turn, a context shift, a reused cache chunk - wherever it differs, they are cut there
-        {
-            const size_t lim = std::min(text.size(), runs.tokens.size());
-            const size_t same = (size_t) (std::mismatch(text.begin(), text.begin() + lim, runs.tokens.begin()).first - text.begin());
-            if (same < runs.tokens.size()) {
-                runs_truncate((llama_pos) same);
-            }
         }
         // the positions both the prompt and the cache hold: a token just sampled is not in the cache yet
         const int64_t n_tok   = prompt.n_tokens();
