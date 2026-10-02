@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 240" width="1000" height="240" role="img" aria-label="GSQHalo.cpp">
+  <defs>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F59F00"/>
+      <stop offset="1" stop-color="#E8590C"/>
+    </linearGradient>
+  </defs>
+  <circle cx="120" cy="120" r="78" fill="none" stroke="#3D444D" stroke-width="2"/>
+  <circle cx="120" cy="120" r="64" fill="none" stroke="url(#ring)" stroke-width="12"/>
+  <rect x="89" y="122" width="16" height="32" rx="5" fill="#F59F00"/>
+  <rect x="112" y="106" width="16" height="48" rx="5" fill="#F08C00"/>
+  <rect x="135" y="90" width="16" height="64" rx="5" fill="#E8590C"/>
+  <text x="236" y="128" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="74" font-weight="700" fill="#F0F6FC" letter-spacing="-1">GSQHalo<tspan font-weight="400" fill="#9198A1">.cpp</tspan></text>
+  <text x="240" y="176" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" fill="#9198A1">GSQ prefill · MTP that fits · KV cache on SSD · AMD Strix Halo</text>
+</svg>

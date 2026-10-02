@@ -1,184 +1,139 @@
-# strix-llama.cpp
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/gsqhalo/banner-dark.svg">
+    <img src="docs/gsqhalo/banner-light.svg" alt="GSQHalo.cpp" width="760">
+  </picture>
+</p>
 
-<img src="halo-box.png" alt="Halo Box" width="260">
+<p align="center">
+  <b>llama.cpp for the GSQ-RCO quantizations of Qwen3.8-Flash-Next on AMD Strix Halo</b>
+</p>
 
-<b>llama.cpp for AMD Strix Halo</b>
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/GPU-gfx1151%20(Radeon%208060S)-E8590C" alt="GPU: gfx1151">
+  <img src="https://img.shields.io/badge/backend-ROCm%207.14%20%2F%20HIP-F08C00" alt="Backend: ROCm/HIP">
+  <a href="https://github.com/halo-box/strix-llama.cpp"><img src="https://img.shields.io/badge/fork%20of-halo--box%2Fstrix--llama.cpp-59636E" alt="Fork of halo-box/strix-llama.cpp"></a>
+</p>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+---
 
-[upstream llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) / [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp)
+The [GSQ-RCO quantizations](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) of Qwen3.8-Flash-Next
+fit the model into a 96 GB Strix Halo box. They use expert types such as IQ2_XXS, IQ2_S, IQ3_XXS and Q2_0, and their
+hyper-connections are BF16. On the fork this builds on, those tensors ran on generic fallback kernels. MTP used up the
+memory needed for a second long-context slot, and a server with two 256K slots crashed.
 
-## Halo Box
+GSQHalo.cpp fixes those three problems for this model on this hardware, and adds a KV cache on SSD that survives slot
+switches and restarts.
 
-The goal is simple: more functionality, and the fastest llama.cpp around. And help the community with a single fast
-llama.cpp fork instead of many competing ones.
+## Results
 
-Halo Box keeps two forks, and which one you want depends on your hardware:
+One machine: Ryzen AI Max+ 395, Radeon 8060S (`gfx1151`), 96 GB LPDDR5X. Model: GSQ-RCO IQ3_XXS (70.6 GiB).
 
-| Fork | What it is |
-| --- | --- |
-| [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) | Stays close to mainline. Tracks upstream `master` and adds features and speedups on top, without diverging from how upstream works. |
-| [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) (this repo) | Purely optimised for AMD Strix Halo machines (Ryzen AI Max+, RDNA 3.5 / gfx1151). Free to diverge from upstream wherever that buys speed. |
+**Kernels** (`llama-bench`, tokens/s):
 
-Use `halo-box/llama.cpp` if you want upstream behaviour plus extras. Use this repo if you run a Strix Halo box and
-want every last token/s out of it. Everything in `halo-box/llama.cpp` is merged in here regularly, so this repo is a
-superset of it.
+| | halo-box/strix-llama.cpp | GSQHalo.cpp |
+| --- | ---: | ---: |
+| Prefill pp4096, empty context | 1019 | **1401** |
+| Prefill pp4096, at 32K | 977 | **1310** |
+| Prefill pp4096, at 128K | 892 | **1188** |
+| Decode tg128, at 128K | 24.2 | 24.2 |
+| Perplexity, 32 × 4096 tokens of wikitext | 3.9044 | 3.9037 |
 
-## What this is
+Each side ran with its recommended flags: the base with `-lzm on -b 4096 -ub 4096`, GSQHalo with
+`-lzm on-direct -b 32768 -ub 8192`. With the same flags (`-b/-ub 4096`), the first four kernel steps alone took pp4096
+from 1003 to about 1350 t/s. [The docs](docs/gsqhalo/README.md#results) give every step with its own before/after.
 
-A community fork of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) for **AMD Strix Halo** - the Ryzen AI Max / Max+ 300 series
-APUs (`gfx1151`, RDNA 3.5 integrated GPU, up to 128 GB of unified LPDDR5X shared between CPU and GPU).
+**MTP and memory** (`llama-server`, the same build with and without the MTP commits):
 
-Strix Halo is an unusual target. It has more addressable memory than almost any consumer discrete GPU, and far less
-bandwidth; the iGPU shares its memory controller with the CPU; and both the Vulkan (RADV) and ROCm/HIP paths have
-RDNA 3.5 specific behaviour that upstream has no hardware to reproduce. Changes that only make sense on this one
-device - or that need a lot of measurement on it before they are ready to propose anywhere else - live here.
+| | Before | GSQHalo.cpp |
+| --- | ---: | ---: |
+| Draft compute buffers, 2 × 256K | 3809 MiB | **520 MiB** |
+| Server RSS, one slot with MTP | 10.5 GiB | **4.9 GiB** |
+| Prefill with MTP, 128K prompt | 1193 t/s | **1386 t/s** |
+| 2 × 256K slots with MTP in 96 GB | ran out of memory | **runs, ≥ 8 GiB free** |
 
-Practically, that means this repo has its own rules - most visibly, **AI coding agents may open pull requests here**.
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
+**SSD KV cache:** a 29.7K-token conversation that left its slot comes back from disk in 2.5 s. On the base,
+re-prefilling it took 33.7 s.
+
+## What's inside
+
+- **GSQ prefill kernels** (ROCm/HIP):
+  - fixed MoE tile selection for the low-bit experts;
+  - slice decoders that write 8 weights per lane;
+  - BF16 hyper-connection fusions and a dedicated HC-Down kernel;
+  - a Q8_1 activation shared by several dense readers;
+  - QSA attention that skips empty tiles;
+  - per-layer-embedding reads overlapped with GPU work.
+- **MTP that fits:** over the prompt, the draft head computes only its K/V. It reserves buffers for that graph, not for
+  the whole context, and keeps one hidden-state row instead of three copies of all of them. Large prefill ubatches skip
+  the recurrent rollback snapshots.
+- **Multi-slot fix:** with a unified KV cache, the QSA kernels accepted at most 262 140 cells across *all* slots. Above
+  that the server aborted. The kernels now share one limit (2^24) with the model's gate.
+- **Persistent KV cache on SSD** (`--cache-dir`): the disk tier v3 of StrixLlama, ported to Linux with direct I/O and
+  without mmap. Conversations are written while they grow, restored straight into the KV cells, and kept across
+  restarts.
+
+[docs/gsqhalo/README.md](docs/gsqhalo/README.md) lists every change with its commit, its off switch where there is one,
+and its measurements.
 
 ## Quick start
 
-Build from source. Two backends are worth using on Strix Halo:
-
-**Vulkan** (RADV on Mesa; the easiest path, and the best one for most models)
-
 ```sh
-cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release -j
+git clone https://github.com/Aristo94/GSQHalo.cpp && cd GSQHalo.cpp
+podman build -f .devops/gsqhalo.Dockerfile --build-arg COMMIT=$(git rev-parse --short HEAD) -t gsqhalo .
 ```
 
-**ROCm / HIP** (needs ROCm installed; build for `gfx1151` explicitly)
+The container builds for `gfx1151` with Fedora 44 and AMD's ROCm 7.14 packages, the toolchain all numbers above come
+from. A native build works as in upstream, with `-DGGML_HIP=ON -DGPU_TARGETS=gfx1151`.
+
+One slot, 256K context, MTP (`mtp-head-Q8_0.gguf` is a GGUF of the model's MTP head):
 
 ```sh
-HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
-    cmake -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release -j
+llama-server -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
+  -md mtp-head-Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 \
+  -c 262144 -ngl 999 -fa on -lm dio -lzm on-direct -t 4 -b 8192 -ub 8192 \
+  --cache-ram 2048 -ctxcp 8 --jinja --reasoning off
 ```
 
-Then:
+The docs have a two-slot config with the SSD cache, along with the flags to avoid.
 
-```sh
-# chat, pulling the model straight from Hugging Face
-./build/bin/llama-cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+## Lineage and related forks
 
-# OpenAI-compatible API server + web UI on http://localhost:8080
-./build/bin/llama-server -hf ggml-org/Qwen3.5-0.8B-GGUF
+```
+ggml-org/llama.cpp                 upstream
+└─ halo-box/llama.cpp              close to upstream, adds features and speedups
+   └─ halo-box/strix-llama.cpp     Strix Halo only; our base is 307c50d (PR #123)
+      └─ GSQHalo.cpp               this repository: GSQ-RCO Qwen3.8-Flash-Next
 ```
 
-Full build documentation, including Windows and Docker, is in [docs/build.md](docs/build.md).
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp): upstream.
+- [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) and
+  [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp): everything they add is still here, including
+  the Vulkan and ROCm tuning for RDNA 3.5, the reasoning budget, ROCmFPx quants and speculative prefill. Their README as
+  of our base is kept in [docs/halo-box/README.md](docs/halo-box/README.md).
+- [StrixLlama / Rulith Inference](https://github.com/rulith-dev/rulith-inference): the origin of the disk tier, a
+  Windows-first stack for large MoE models on one Strix Halo machine.
+- [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp): a sibling fork of upstream llama.cpp for
+  Qwen3.8-Flash-Next on Strix Halo, with the engram table on SSD.
 
-## Running on Strix Halo
-
-**Give the iGPU enough memory.** The APU's memory is shared, and the GPU can only use what the firmware and kernel let
-it map. Two things control this: the UMA / dedicated-VRAM split in your BIOS, and the `amdgpu` GTT limit on Linux
-(`amdgpu.gttsize`, in MB, and `ttm.pages_limit`, in 4 KB pages, as kernel command-line parameters). Which of those you
-need depends on your kernel version - newer kernels size GTT more generously on their own. If a model that clearly
-fits in RAM fails to allocate, this is almost always why.
-
-**ROCm and batched inference.** On `gfx1151` there is an async-execution correctness bug in the HIP path: batched
-inference can return badly wrong output (perplexity ~88 against ~9.4 for the same model). Setting
-`HIP_LAUNCH_BLOCKING=1` serializes kernel launches and restores correctness, at a performance cost. Our ROCm CI runs
-with it set. It is a workaround for a ROCm/HIP issue, not a fix, and it should go away when that is fixed upstream.
-
-**Vulkan mat-vec chunking.** Batched mat-vec at 3, 5 and 6 columns is several times slower than at 1, 2 and 4 on RADV
-here, which hits speculative decoding hard (it verifies at exactly those batch sizes). This fork splits such batches
-into column counts that are measured to scale. Set `GGML_VK_MMV_NO_SPLIT=1` to restore the single upstream dispatch,
-e.g. to compare against it.
-
-**Measure things.** `GGML_VK_PERF_LOGGER=1` (any value) gives per-op timings on the Vulkan backend and is how most of the findings
-above were made. `llama-bench` and `llama-perplexity` are the tools for before/after numbers, and PRs here are
-expected to carry them - see [Benchmarking requirements](CONTRIBUTING.md#benchmarking-requirements).
-
-## What differs from upstream
-
-Everything else is upstream `llama.cpp`. The additions currently carried here:
-
-**Inherited from [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp)** (general features, sent upstream from there)
-
-| Change | Flag / switch | What it does |
-| --- | --- | --- |
-| Speculative prefill | `--spec-prefill` | A small draft model scores prompt tokens by attention importance so the target model only prefills the ones that matter, cutting time-to-first-token on long prompts |
-| Adaptive speculative draft length | `--spec-draft-adaptive` | Sizes each draft from a measured per-sequence acceptance EMA rather than always drafting `--spec-draft-n-max`; speeds up MTP and DFlash |
-| Vulkan fixes and tuning for RDNA 3.5 | | Driver-gated coopmat LDS stride padding, UMA bulk readback gated on host-cached mappings, IQ3_S mat-vec at batch sizes > 4, and a radix top-k kernel for large k |
-| Hidden server presets | `hidden` in the models `.ini` | Keep a model loadable by name while omitting it from `GET /models` |
-
-**Strix Halo only** (lives here, measured on `gfx1151`)
-
-| Change | Flag / switch | What it does |
-| --- | --- | --- |
-| Multi-point reasoning budget | `--reasoning-budget-*` (upstream has the hard budget only) | Intro message, two soft warnings, a grace period to finish a paragraph after the budget runs out, and reasoning-token usage telemetry |
-| Vulkan batched mat-vec chunking | `GGML_VK_MMV_NO_SPLIT=1` to disable | Dispatches batched mat-vec at the column counts that actually scale on RDNA 3.5, instead of the slow NUM_COLS shader variants |
-| ROCm/HIP quantized matmul on RDNA 3.5 | | MMQ/MMVQ tile configurations and register prefetching, compact `MUL_MAT_ID` with quant- and shape-specific tiles for 256-expert MoE prefill, fused activation quantization for Q8_0 and Q6_K decode |
-| ROCm/HIP MoE decode fusion | `GGML_CUDA_DISABLE_WEIGHTED_DOWN=1`, `GGML_CUDA_DISABLE_MMID_512=1` | Fused routing, weighted expert reduction and shared-expert gate for Qwen3.5/3.6 and Ling style MoE |
-| ROCm/HIP Gated DeltaNet | `GGML_CUDA_DISABLE_GDN_GATE=1` | DPP reductions and a tiled multi-column kernel for prefill; the whole conv -> norm -> gate -> recurrence -> state copy decode chain as one kernel |
-| ROCm/HIP grouped decode matvecs | `GGML_CUDA_DISABLE_MMV_GROUP=1` | Consecutive single-column matvecs that read the same activation (gate/up pairs, hyper-connection projections) launch as one kernel |
-| ROCm/HIP flash attention on RDNA 3.5 | | WMMA path for D=256 prefill at depth, Q8_0 KV tile kernel for decode |
-| Speculative checkpoints on device | | `llama-server` keeps speculative-decoding checkpoints in device memory instead of copying them to the host |
-| ROCmFPx quant types | `llama-quantize` types `Q4_0_ROCMFP4`, `Q4_0_ROCMFP4_FAST`, `Q2/Q3/Q6/Q8_0_ROCMFPX` and the `_LEAN`/`_COHERENT`/`_STRIX` recipes | Loads the ROCmFP4 GGUFs published for Strix Halo. CPU codecs plus Vulkan dequant, mat-vec, matmul and integer-dot kernels. Weight formats only: not accepted as KV-cache types |
-| Repeatable output at depth | | Freed KV cells are zeroed so masked-out rows never carry stale K/V, and the Vulkan radix top-k assigns output slots deterministically |
-
-Every ROCm/HIP change above is guarded on architecture, shape and layout, so other devices see upstream behaviour.
-Run `--help`, or see [tools/server/README.md](tools/server/README.md), for the full options.
-
-## Supported backends
-
-The ones that matter on this hardware:
-
-| Backend | Notes |
-| --- | --- |
-| [Vulkan](docs/build.md#vulkan) | RADV on the RDNA 3.5 iGPU - the default recommendation |
-| [HIP](docs/build.md#hip) | ROCm on `gfx1151` - see the `HIP_LAUNCH_BLOCKING` note above |
-| [CPU](docs/build.md) | Zen 5 cores with AVX-512 - useful for offloading part of a model, though it shares bandwidth with the iGPU |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU acceleration |
-| [RPC](tools/rpc) | Distribute a model across several machines |
-
-`llama.cpp` supports many more (CUDA, Metal, SYCL, CANN, OpenCL, WebGPU, ...); they are all still present in the tree
-and unmodified. See the [upstream README](https://github.com/ggml-org/llama.cpp) for that list.
+GitHub links only one fork per account in a fork network, so this repository is not shown as a GitHub fork. The full
+upstream history is included.
 
 ## Documentation
 
-#### Tools
+- [docs/gsqhalo/README.md](docs/gsqhalo/README.md): every change with its commit and switch, all measurements, server
+  configs, known limits.
+- [docs/halo-box/README.md](docs/halo-box/README.md): what halo-box/strix-llama.cpp changes compared to upstream, and how
+  to set up a Strix Halo machine (GTT size, ROCm notes).
+- [docs/build.md](docs/build.md) and [tools/server/README.md](tools/server/README.md): the upstream build and server
+  documentation.
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+## Credits
 
-#### Development
+Built on the work of the [llama.cpp](https://github.com/ggml-org/llama.cpp) contributors, [Halo Box](https://github.com/halo-box)
+and Victor Shaw (StrixLlama, MIT; the disk tier code keeps its copyright notice). The quantizations are by
+[ISTA DASLab](https://huggingface.co/ISTA-DASLab), and the model is by the Qwen team. GSQHalo.cpp is an independent
+project, not affiliated with any of them.
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-
-## Contributing
-
-This is a small community project. Strix Halo owners with a benchmark, a bug report, or a patch are exactly who it is
-for.
-
-- Anyone can open a PR, **including AI coding agents acting on their own** - this repo permits automated PR submission,
-  unlike upstream. The rules that replace the upstream ban are in [AGENTS.md](AGENTS.md).
-- Device-specific claims need numbers from the device, against a baseline you built and ran yourself. What exactly to
-  report is in [Benchmarking requirements](CONTRIBUTING.md#benchmarking-requirements); read it before you benchmark.
-- If your change is not Strix Halo specific, send it to [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp)
-  instead, so it can reach upstream.
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before your first PR.
-
-CI runs the standard llama.cpp suite plus a self-hosted `gfx1151` ROCm job on real hardware.
-
-## Acknowledgements
-
-This project is a fork and owes everything to the people who built what it forks:
-
-- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml) - Georgi Gerganov and the llama.cpp contributors - MIT license
-- [charlie12345/ROCmFPX](https://github.com/charlie12345/ROCmFPX) - the origin of the ROCmFPx project and the creator of the ROCmFP4 format - MIT license
-- [ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) - a fork of the above, and the tree the ROCmFPx quant formats and reference codecs here were hand-ported from (it shares no git history with llama.cpp, so it cannot be merged) - MIT license
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+Licensed under the [MIT License](LICENSE), like llama.cpp.
