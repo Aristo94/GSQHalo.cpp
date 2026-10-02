@@ -4033,6 +4033,75 @@ struct test_hc_chain : public test_case {
 };
 
 
+// qwen4exp hyper-connection modules at prefill width with the GSQ BF16 weights, as the model builder emits them:
+// combine + grouped norm (+ the inject projection for the next combine), HC down [10240 -> 320], silu, gate GEMM
+// [320 -> 10240] + sigmoid + stream mix, an elementwise "block" on the mixed stream, then the next combine.
+// The inner combines read and write the BF16-only residual stream, like every combine of the trunk.
+struct test_hc_module : public test_case {
+    const int tokens, modules;
+    const bool chain;   // the inject projection feeds the next combine (as in the trunk) or is summed into the output
+    const ggml_type type_w;
+
+    test_hc_module(int tokens, int modules = 3, bool chain = true, ggml_type type_w = GGML_TYPE_BF16)
+        : tokens(tokens), modules(modules), chain(chain), type_w(type_w) {}
+    std::string op_desc(ggml_tensor *) override { return "HC_MODULE"; }
+    std::string vars() override { return VARS_TO_STR4(tokens, modules, chain, type_w); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int embd = 2560, hc = 4, lr = 320;
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        ggml_tensor * block    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
+        ggml_tensor * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        ggml_tensor * xn = nullptr, * injs = nullptr;
+        for (int m = 0; m <= modules; ++m) {
+            if (!chain && m > 0) {   // the projection goes to the output, the combine takes a fresh injection
+                injs = injs ? ggml_add(ctx, injs, inject) : inject;
+                inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+            }
+            ggml_tensor * gamma  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);
+            ggml_tensor * weight = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / hc)), 2.0f);
+            weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
+            if (gf) { ggml_build_forward_expand(gf, residual); ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, weight); }
+            ggml_tensor * combined = ggml_add(ctx, residual, ggml_mul(ctx, ggml_repeat(ctx, block, residual), weight));
+            xn = ggml_reshape_2d(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, combined, 1e-6f), gamma), int64_t(embd) * hc, tokens);
+            if (m == modules) {
+                break;
+            }
+            ggml_tensor * w_inj  = ggml_new_tensor_2d(ctx, type_w, int64_t(embd) * hc, hc);
+            ggml_tensor * w_down = ggml_new_tensor_2d(ctx, type_w, int64_t(embd) * hc, lr);
+            ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, type_w, lr, int64_t(embd) * hc);
+            ggml_tensor * w_blk  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, embd);
+            inject = ggml_mul_mat(ctx, w_inj, xn);
+            if (gf) ggml_build_forward_expand(gf, inject);
+            ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
+            if (gf) ggml_build_forward_expand(gf, lo);
+            lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / hc));
+            ggml_tensor * gate  = ggml_mul_mat(ctx, w_up, lo);
+            ggml_tensor * gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, ggml_sigmoid(ctx, gate)), embd, hc, tokens);
+            ggml_tensor * mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, embd, tokens, gated->nb[1] * hc, 0));
+            for (int c = 1; c < hc; ++c) {
+                mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, embd, tokens, gated->nb[1] * hc, gated->nb[1] * c));
+            }
+            mixed = ggml_scale(ctx, mixed, 1.0f / hc);
+            block = ggml_reshape_3d(ctx, ggml_mul(ctx, mixed, w_blk), embd, 1, tokens);   // an F32 reader, like the trunk's MMQ projections
+            residual = combined;
+        }
+        if (injs) {
+            if (gf) ggml_build_forward_expand(gf, xn);
+            return injs;
+        }
+        return xn;
+    }
+};
+
 // QSA indexer key pooling as the qwen4exp builder emits it: get_rows of 4 member rows per block, reshape to
 // [128, 4, n_blocks, n_stream], the four stream slices summed in order, scaled by 1/4. One fused kernel on HIP.
 struct test_get_rows_mean4 : public test_case {
@@ -11177,6 +11246,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_hc_chain(tokens, type));
         }
     }
+    for (int tokens : {512, 1000}) {
+        // HC down [10240 -> 320] on BF16 weights (the GSQ mixes) through the dedicated tile GEMM
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 320, tokens, 10240, {1, 1}, {1, 1}));
+    }
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int n_stream : {1, 2}) {
             for (int n_blocks : {1, 7, 512, 2048}) {
@@ -11192,6 +11265,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mmb_quant_routed(type, 512, false, true));
         test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true));
         test_cases.emplace_back(new test_mmb_quant_hc(type));
+        if (type == GGML_TYPE_Q8_0) {
+            test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_BF16));   // the GSQ mixes' BF16 gate weights
+        }
         if (type == GGML_TYPE_Q4_K) {
             test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true, 65));
             test_cases.emplace_back(new test_mmb_quant_routed(type, 1025, false, true, 129));
@@ -13870,6 +13946,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             test_cases.emplace_back(new test_moe_prefill(false, 4096, GGML_TYPE_Q2_0));
         }
+        return test_cases;
+    }
+    if (getenv("GGML_PERF_HC")) {
+        // GGML_PERF_HC: the hyper-connection modules of the GSQ qwen4exp mixes at one pp4096 ubatch
+        test_cases.emplace_back(new test_hc_module(4096, 3));
         return test_cases;
     }
     if (getenv("GGML_PERF_DENSE")) {

@@ -260,6 +260,108 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
 #endif
 }
 
+typedef uint32_t mmb_v4u __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ v16s mmb_frag16(const uint16_t * p) {
+    const mmb_v4u v0 = *(const mmb_v4u *) p, v1 = *(const mmb_v4u *)(p + 8);
+    return __builtin_bit_cast(v16s, __builtin_shufflevector(v0, v1, 0, 1, 2, 3, 4, 5, 6, 7));
+}
+// HC down [hc*n_embd -> M <= 384] on BF16 weights (GSQ mixes, or the HC Q8_0 shadow) and the BF16 activation copy.
+// Both operands are loaded coalesced (CPR lanes per BK-wide row slice, spread over all threads) and staged through
+// NBUF LDS buffers (2: one barrier per K step); the F32 epilogue is stored straight from the accumulators. Long K slices
+// (BK 256) matter most: per K step every block reads a 512-byte piece of each of its rows. Staging registers are native
+// vectors without lambdas and rows past M / T are clamped instead of predicated, so nothing lands in scratch.
+// Every output still accumulates its K range in 16-wide WMMA steps in order with the same operand roles as
+// mmb_tile_gemm: bit-identical to mmb_dense_kernel<..., 2>. ldw / ldx: row pitches (elements) of W / X.
+template <int BM, int BN, int WTM, int WTN, int BK, int NBUF = 2>
+__global__ void __launch_bounds__(MMB_NT, 2)
+mmb_hcd_kernel(const uint16_t * __restrict__ W, const uint16_t * __restrict__ X, float * __restrict__ D, const int M, const int K, const int T,
+        const int ldw, const int ldx) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE; // WMMA kernels are RDNA3-only; the host gate keeps other devices off this path
+#else
+    constexpr int WAVES_M = BM / WTM, WAVES_N = (MMB_NT / 32) / WAVES_M, TM = WTM / 16, TN = WTN / 16;
+    static_assert(WAVES_M * WTM == BM && WAVES_N * WTN == BN && WAVES_M * WAVES_N == MMB_NT / 32, "8 waves cover the tile");
+    constexpr int LDS = BK + 8, CPR = BK / 8;                       // 16-byte chunks per row slice
+    constexpr int A_IT = (BM * CPR + MMB_NT - 1) / MMB_NT, B_IT = (BN * CPR + MMB_NT - 1) / MMB_NT;
+    __shared__ __align__(16) uint16_t As[NBUF][BM * LDS];
+    __shared__ __align__(16) uint16_t Bs[NBUF][BN * LDS];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+    const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
+    // global and LDS element offsets of this thread's chunks; rows past the matrix are clamped to its last row (they
+    // only feed outputs that are never stored), chunks past the tile (BM * CPR not a multiple of the block) are not stored
+    const uint16_t * ap[A_IT]; const uint16_t * bp[B_IT]; int al[A_IT], bl[B_IT];
+#pragma unroll
+    for (int i = 0; i < A_IT; ++i) { const int c = tid + i * MMB_NT; ap[i] = W + (size_t) min(m0 + c / CPR, M - 1) * ldw + (c % CPR) * 8; al[i] = c < BM * CPR ? (c / CPR) * LDS + (c % CPR) * 8 : -1; }
+#pragma unroll
+    for (int i = 0; i < B_IT; ++i) { const int c = tid + i * MMB_NT; bp[i] = X + (size_t) min(t0 + c / CPR, T - 1) * ldx + (c % CPR) * 8; bl[i] = c < BN * CPR ? (c / CPR) * LDS + (c % CPR) * 8 : -1; }
+    mmb_v4u ra[A_IT], rb[B_IT];
+#pragma unroll
+    for (int i = 0; i < A_IT; ++i) ra[i] = *(const mmb_v4u *) ap[i];
+#pragma unroll
+    for (int i = 0; i < B_IT; ++i) rb[i] = *(const mmb_v4u *) bp[i];
+#pragma unroll
+    for (int i = 0; i < A_IT; ++i) if (al[i] >= 0) *(mmb_v4u *)(As[0] + al[i]) = ra[i];
+#pragma unroll
+    for (int i = 0; i < B_IT; ++i) if (bl[i] >= 0) *(mmb_v4u *)(Bs[0] + bl[i]) = rb[i];
+    __syncthreads();
+    v8f acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
+    const int nks = K / BK, r = lane & 15;
+    for (int ks = 0; ks < nks; ++ks) {
+        const int s = NBUF == 2 ? (ks & 1) : 0;
+        const bool more = ks + 1 < nks;
+        if (more) {   // next K step's global loads in flight during this step's WMMAs
+            const int k0 = (ks + 1) * BK;
+#pragma unroll
+            for (int i = 0; i < A_IT; ++i) ra[i] = *(const mmb_v4u *)(ap[i] + k0);
+#pragma unroll
+            for (int i = 0; i < B_IT; ++i) rb[i] = *(const mmb_v4u *)(bp[i] + k0);
+        }
+#pragma unroll
+        for (int kk = 0; kk < BK; kk += 16) {
+            v16s a[TM], b[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) a[i] = mmb_frag16(As[s] + (wm * WTM + i * 16 + r) * LDS + kk);
+#pragma unroll
+            for (int j = 0; j < TN; ++j) b[j] = mmb_frag16(Bs[s] + (wn * WTN + j * 16 + r) * LDS + kk);
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]);
+        }
+        if constexpr (NBUF == 1) __syncthreads();
+        if (more) {   // NBUF 2: the other buffer was last read before the previous barrier
+            const int sn = NBUF == 2 ? (s ^ 1) : 0;
+#pragma unroll
+            for (int i = 0; i < A_IT; ++i) if (al[i] >= 0) *(mmb_v4u *)(As[sn] + al[i]) = ra[i];
+#pragma unroll
+            for (int i = 0; i < B_IT; ++i) if (bl[i] >= 0) *(mmb_v4u *)(Bs[sn] + bl[i]) = rb[i];
+        }
+        __syncthreads();
+    }
+    // lane holds output column m_base + (lane & 15) for token rows 2e + (lane >> 4) of each 16-token fragment
+    const int cm = lane & 15, cn = lane >> 4;
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int m = m0 + wm * WTM + i * 16 + cm;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int t = t0 + wn * WTN + j * 16 + 2 * e + cn;
+                if (t < T && m < M) D[(size_t) t * M + m] = acc[i][j][e];
+            }
+        }
+    }
+#endif
+}
+
 #if defined(__HIP_PLATFORM_AMD__)
 __device__ __forceinline__ float gm_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
 __device__ __forceinline__ float gm_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
@@ -1171,6 +1273,16 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     static const int HCD = getenv("MMB_HCD_TILE") ? atoi(getenv("MMB_HCD_TILE")) : 3;
     if (HCD && (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_BF16) && M <= 384 && K >= 4096 && T >= 512) {
         const bool hbf = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0;
+        // MMB_HCD_V2 (default 1): the dedicated HC down kernel <64,32,16,16> with BK 256, bit-identical
+        // (pp4096 ubatch 129 instead of 188 ms); 0 = the generic tiles below. The BF16-only output (hbf) stays on those.
+        static const int V2 = getenv("MMB_HCD_V2") ? atoi(getenv("MMB_HCD_V2")) : 1;
+        const uint16_t * WB = src0->type == GGML_TYPE_BF16 ? (const uint16_t *) W : hc_shadow;
+        if (V2 && WB && !hbf && K % 256 == 0) {
+            dim3 g((M + 63) / 64, (T + 31) / 32);
+            mmb_hcd_kernel<64, 32, 16, 16, 256, 1><<<g, MMB_NT, 0, stream>>>(WB, xhp, D, M, K, T, K, K);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         uint16_t * Dh2 = hbf ? (uint16_t *) dst->data : nullptr; const bool sf = !hbf;
         auto go = [&](auto tag, const uint8_t * WP) {
             constexpr int WT = decltype(tag)::value;
