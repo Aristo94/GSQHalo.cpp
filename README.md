@@ -87,13 +87,15 @@ podman build -f .devops/gsqhalo.Dockerfile --build-arg COMMIT=$(git rev-parse --
 The container builds for `gfx1151` with Fedora 44 and AMD's ROCm 7.14 packages, the toolchain all numbers above come
 from. A native build works as in upstream, with `-DGGML_HIP=ON -DGPU_TARGETS=gfx1151`.
 
-One slot, 256K context, MTP (`mtp-head-Q8_0.gguf` is a GGUF of the model's MTP head):
+One slot, 256K context, MTP, thinking at `xhigh` (`mtp-head-Q8_0.gguf` is a GGUF of the model's MTP head). `xhigh` is
+the reasoning effort the GSQ-RCO quants are meant to run at, and the chat template's default. The template also accepts
+`medium` and `low`.
 
 ```sh
 llama-server -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
   -md mtp-head-Q8_0.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 \
   -c 262144 -ngl 999 -fa on -lm dio -lzm on-direct -t 4 -b 8192 -ub 8192 \
-  --cache-ram 2048 -ctxcp 8 --jinja --reasoning off
+  --cache-ram 2048 -ctxcp 8 --jinja --reasoning on --reasoning-effort xhigh
 ```
 
 The docs have a two-slot config with the SSD cache, along with the flags to avoid.

@@ -233,7 +233,7 @@ llama-server \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 \
   -c 262144 -ngl 999 -fa on -lm dio -lzm on-direct -t 4 \
   -b 8192 -ub 8192 --cache-ram 2048 -ctxcp 8 \
-  --jinja --reasoning off
+  --jinja --reasoning on --reasoning-effort xhigh
 ```
 
 **Two slots of 256K, unified KV, idle conversations on SSD:**
@@ -247,13 +247,15 @@ llama-server \
   -ngl 999 -fa on -lm dio -lzm on-direct -t 4 -b 4096 -ub 4096 \
   --cache-ram 0 -ctxcp 8 --no-cache-idle-slots \
   --cache-dir /mnt/ssd/llama-cache --cache-dir-max 81920 \
-  --jinja --reasoning off
+  --jinja --reasoning on --reasoning-effort xhigh
 ```
 
 To save all idle conversations to disk before stopping the server, send `curl -X POST http://127.0.0.1:8080/strix/persist`.
 
 Tips for these configs:
 
+- **Thinking at `xhigh`.** This is the reasoning effort the GSQ-RCO quants are meant to run at, and the chat template's
+  default. The template also accepts `medium` and `low`. A request can override it with `"reasoning_effort"`.
 - **`-lzm on-direct`** reads the embedding table with direct I/O. Never use `-lzm off`: it loads the 26.8 GiB table into
   RAM.
 - **Keep `-b 4096` on multi-slot servers.** With `-b 32768`, a long prompt in one slot stalls the decode of the other
