@@ -188,7 +188,7 @@ public:
     // disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw): a sequence's rows by position (llama_strix_kv_*). A range of n positions
     // is laid out as a state's data is, without its headers: every layer's K rows for the n positions, then every
     // layer's V rows. row_size() is the bytes one position takes, 0 when this cache cannot serve rows (V transposed,
-    // several streams, cells shared with another cache).
+    // cells shared with another cache). Without -kvu the rows are those of the sequence's own stream.
     size_t row_size() const;
     // the rows of positions [p0, p0 + n) of seq_id into dst; false when a position has no cell of its own or more
     // than one, or its cell is not a plain text token's (an image under M-RoPE)

@@ -1125,7 +1125,7 @@ extern "C" {
     // cache's (the KV cache, the sparse-attention indexer) every layer's K and V for that position; a range of n
     // positions is laid out per cache, and within it per layer, as a state's data is. The recurrent state is not in the
     // rows: it is one per sequence, and goes through llama_state_seq_*_ext with LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY.
-    // llama_strix_kv_row_size is 0 for a context that cannot serve rows (another memory, V transposed, several streams).
+    // llama_strix_kv_row_size is 0 for a context that cannot serve rows (another memory, V transposed).
     LLAMA_API size_t llama_strix_kv_row_size(const struct llama_context * ctx);
     // the rows of positions [p0, p0 + n) of seq_id into dst (n * row size bytes). False when a position has no cell
     // or more than one, or its cell is not a plain text token's

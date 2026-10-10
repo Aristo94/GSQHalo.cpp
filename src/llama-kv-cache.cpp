@@ -1250,7 +1250,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 //
 
 size_t llama_kv_cache::row_size() const {
-    if (v_trans || n_stream != 1 || other) {
+    if (v_trans || other) {
         return 0;
     }
 
@@ -1272,7 +1272,7 @@ bool llama_kv_cache::seq_row_cells(llama_seq_id seq_id, llama_pos p0, uint32_t n
         return false;
     }
 
-    const auto & cells = v_cells[0];
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
     const auto & pc    = cells.seq_pos_cells(seq_id);
 
     // a text token's cell carries its position in both spatial slots when the batch had M-RoPE sections
@@ -1321,6 +1321,7 @@ bool llama_kv_cache::seq_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n,
     if (!seq_row_cells(seq_id, p0, n, false, runs)) {
         return false;
     }
+    const uint32_t strm = seq_to_stream[seq_id];
 
     // a sequence decoded alongside others sits interleaved with them in a unified cache: runs of rising cells at
     // most kGap bytes apart are read as one span (at most kSpan bytes) and cut on the host, as llama_io_write_host does
@@ -1331,7 +1332,7 @@ bool llama_kv_cache::seq_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n,
     size_t off = 0;
     for (int kv = 0; kv < 2; ++kv) {
         for (const auto & layer : layers) {
-            ggml_tensor * t = kv == 0 ? layer.k_stream[0] : layer.v_stream[0];
+            ggml_tensor * t = kv == 0 ? layer.k_stream[strm] : layer.v_stream[strm];
             if (t == nullptr) {
                 continue;
             }
@@ -1369,11 +1370,12 @@ bool llama_kv_cache::seq_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n,
     if (n > src_rows || !seq_row_cells(seq_id, p0, n, true, runs)) {
         return false;
     }
+    const uint32_t strm = seq_to_stream[seq_id];
 
     size_t off = 0;
     for (int kv = 0; kv < 2; ++kv) {
         for (const auto & layer : layers) {
-            ggml_tensor * t = kv == 0 ? layer.k_stream[0] : layer.v_stream[0];
+            ggml_tensor * t = kv == 0 ? layer.k_stream[strm] : layer.v_stream[strm];
             if (t == nullptr) {
                 continue;
             }
@@ -1410,7 +1412,7 @@ bool llama_kv_cache::seq_alloc(llama_seq_id seq_id, const llama_token * tokens, 
         return true;
     }
 
-    auto & cells = v_cells[0];
+    auto & cells = v_cells[seq_to_stream[seq_id]];
 
     n_pos = std::max(1u, n_pos);
     llama_batch_allocr balloc(n_pos);

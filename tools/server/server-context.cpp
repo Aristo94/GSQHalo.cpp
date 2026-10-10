@@ -1994,13 +1994,12 @@ private:
     }
 
     // disk tier (ported from StrixLlama, MIT, (c) 2026 Victor Shaw): the store under the prompt cache, when both contexts serve rows by
-    // position (the qwen4exp memory, or a plain KV cache; -fa on, one KV stream)
+    // position (the qwen4exp memory, or a plain KV cache; -fa on)
     void init_disk_tier() {
         const uint64_t row_tgt = llama_strix_kv_row_size(ctx_tgt);
         const uint64_t row_dft = ctx_dft ? llama_strix_kv_row_size(ctx_dft) : 0;
         if (row_tgt == 0 || (ctx_dft && row_dft == 0)) {
-            SRV_WRN("%s", "disk prompt cache: this server's contexts give no rows by position (they need -fa on and one KV stream - "
-                    "-kvu with several slots); not enabled\n");
+            SRV_WRN("%s", "disk prompt cache: this server's contexts give no rows by position (they need -fa on); not enabled\n");
             return;
         }
         // a state is only meaningful to the model that computed it, and two quants of one model - or two fine-tunes of
