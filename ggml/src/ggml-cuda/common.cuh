@@ -1244,6 +1244,11 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // owned by the backend context: set while it captures a CUDA graph, whose kernels keep pointers into the pool,
+    // and counted up when the pool frees cached buffers, which leaves the graphs captured before with stale pointers
+    const bool * graph_capturing = nullptr;
+    uint64_t   * n_releases      = nullptr;
 };
 
 template<typename T>
@@ -1319,6 +1324,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    uint64_t pool_releases = 0; // pool_releases of the context at capture: once it moved, the graph is captured anew
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1613,6 +1619,8 @@ struct ggml_backend_cuda_context {
     }
 
     // pool
+    bool     graph_capturing = false; // a CUDA graph is being captured: the pools keep their cached buffers
+    uint64_t pool_releases   = 0;     // frees of cached pool buffers, see ggml_cuda_graph::pool_releases
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
@@ -1620,6 +1628,8 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool(int device) {
         if (pools[device][curr_stream_no] == nullptr) {
             pools[device][curr_stream_no] = new_pool_for_device(device, curr_stream_no);
+            pools[device][curr_stream_no]->graph_capturing = &graph_capturing;
+            pools[device][curr_stream_no]->n_releases      = &pool_releases;
         }
         return *pools[device][curr_stream_no];
     }

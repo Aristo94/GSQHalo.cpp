@@ -490,6 +490,27 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             b.size = 0;
             return ptr;
         }
+        // the request outgrew every cached buffer: free the ones it outgrew. Temporaries that grow with the K/V depth
+        // (QSA pack, top-k) outgrow the pool every 5% of depth, and keeping each predecessor grows the pool to ~20x
+        // the largest request. cudaFree waits for kernels that still use a returned buffer; a graph being captured
+        // has not run them yet, so then the buffers stay
+        if (!graph_capturing || !*graph_capturing) {
+            bool released = false;
+            for (int i = 0; i < MAX_BUFFERS; ++i) {
+                ggml_cuda_buffer & b = buffer_pool[i];
+                if (b.ptr != nullptr && b.size < size) {
+                    ggml_cuda_set_device(device);
+                    CUDA_CHECK(cudaFree(b.ptr));
+                    pool_size -= b.size;
+                    b.ptr  = nullptr;
+                    b.size = 0;
+                    released = true;
+                }
+            }
+            if (released && n_releases) {
+                ++*n_releases;
+            }
+        }
         void * ptr;
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
@@ -502,6 +523,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
+            if (n_releases) {
+                ++*n_releases;
+            }
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
@@ -6614,7 +6638,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instance == nullptr;
+                    // the pool freed buffers since the capture: the graph may point into them
+                    cuda_graph_update_required = graph->instance == nullptr || graph->pool_releases != cuda_ctx->pool_releases;
                 }
             }
         }
@@ -6628,10 +6653,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }
 
+#ifdef USE_CUDA_GRAPH
+        cuda_ctx->graph_capturing = true;
+        graph->pool_releases = cuda_ctx->pool_releases;
+#endif // USE_CUDA_GRAPH
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    cuda_ctx->graph_capturing = false;
 
     cuda_ctx->mmb_after_compute = true;
     return GGML_STATUS_SUCCESS;
