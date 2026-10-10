@@ -100,12 +100,12 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported(int device, const ggml_tensor
         q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > QSA_DECODE_MAX_QUERIES ||
         k->ne[1] < 1 || k->ne[1] > GGML_FLASH_ATTN_EXT_TOP_K_MAX_KV || v->ne[1] != k->ne[1] ||
         k->ne[2] < 1 || q->ne[2] % k->ne[2] || v->ne[2] != k->ne[2] ||
-        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+        !qsa_streams_supported(q, k, v, m, ids) ||
         q->nb[0] != 4 || ids->nb[0] != 4 ||
-        ids->ne[0] < 1 || ids->ne[0] > 2560 || ids->ne[1] < q->ne[1] || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        ids->ne[0] < 1 || ids->ne[0] > 2560 || ids->ne[1] < q->ne[1] || ids->ne[2] != 1 ||
         !ggml_is_contiguous(dst)) { return false; }
     return !m || (m->type == GGML_TYPE_F16 && m->nb[0] == 2 && m->ne[0] >= k->ne[1] &&
-                  m->ne[1] >= q->ne[1] && m->ne[2] == 1 && m->ne[3] == 1);
+                  m->ne[1] >= q->ne[1] && m->ne[2] == 1);
 }
 
 static __global__ void qsa_decode_unique_ids(const char * input, size_t stride, int * output, int count, int keys) {

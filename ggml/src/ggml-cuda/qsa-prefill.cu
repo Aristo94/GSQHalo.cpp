@@ -573,18 +573,18 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(int device, const ggml_tenso
             !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) return false;
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params+4, 4); memcpy(&softcap, (const char *) dst->op_params+8, 4);
     // the mask is optional: a maskless op relies on the index rows naming only visible cells (-1 elsewhere)
-    if (m && (m->type!=GGML_TYPE_F16 || m->nb[0]!=2 || m->ne[0]<k->ne[1] || m->ne[1]<q->ne[1] || m->ne[2]!=1 || m->ne[3]!=1)) return false;
+    if (m && (m->type!=GGML_TYPE_F16 || m->nb[0]!=2 || m->ne[0]<k->ne[1] || m->ne[1]<q->ne[1] || m->ne[2]!=1)) return false;
     return bias==0 && softcap==0 && q->type==GGML_TYPE_F32 && qsa_kv_type_supported(k) && v->type==k->type && qsa_kv_type_supported(v) &&
         dst->type==GGML_TYPE_F32 && ids->type==GGML_TYPE_I32 &&
         q->ne[0]==256 && k->ne[0]==256 && v->ne[0]==256 && q->ne[1]>=128 && q->ne[1]<=INT_MAX &&
         k->ne[1]>0 && k->ne[1]<=GGML_FLASH_ATTN_EXT_TOP_K_MAX_KV && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
         k->ne[2]>0 && k->ne[2]<=65535 && q->ne[2]==12*k->ne[2] && v->ne[2]==k->ne[2] &&
-        q->ne[3]==1 && k->ne[3]==1 && v->ne[3]==1 &&
+        qsa_streams_supported(q,k,v,m,ids) &&
         q->nb[0]==4 && ids->nb[0]==4 &&
         q->nb[1]%16==0 && q->nb[2]%16==0 && uintptr_t(q->data)%16==0 &&
         k->nb[1]%16==0 && k->nb[2]%16==0 && uintptr_t(k->data)%16==0 &&
         ids->nb[1]%4==0 && uintptr_t(ids->data)%4==0 && ids->ne[0]>0 && ids->ne[0]<=2560 &&
-        ids->ne[1]>=q->ne[1] && ids->ne[2]==1 && ids->ne[3]==1 && ggml_is_contiguous(dst);
+        ids->ne[1]>=q->ne[1] && ids->ne[2]==1 && ggml_is_contiguous(dst);
 }
 
 // one KV head per grid row: the per-head counts (32*nk, 64*nk) stay below 2^32 for every supported nk, whatever

@@ -798,15 +798,44 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+#if defined(GGML_USE_HIP)
+// one K/V stream per sequence (no -kvu): run the QSA launcher once per stream on single-stream views at s*nb[3].
+// Each stream then gets exactly the result of a single-stream op, and its pool buffers keep the single-stream size
+static void ggml_cuda_flash_attn_ext_qsa_streams(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        void (*launch)(ggml_backend_cuda_context &, ggml_tensor *)) {
+    const int64_t n_stream = dst->src[0]->ne[3];
+    if (n_stream == 1) {
+        launch(ctx, dst);
+        return;
+    }
+    ggml_tensor src[GGML_MAX_SRC];
+    ggml_tensor out = *dst;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (dst->src[i] == nullptr) {
+                continue;
+            }
+            src[i] = *dst->src[i];
+            src[i].data = (char *) dst->src[i]->data + s*dst->src[i]->nb[3];
+            src[i].ne[3] = 1;
+            out.src[i] = &src[i];
+        }
+        out.data = (char *) dst->data + s*dst->nb[3];
+        out.ne[3] = 1;
+        launch(ctx, &out);
+    }
+}
+#endif
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 #if defined(GGML_USE_HIP)
     if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx.device, dst)) {
-        ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
+        ggml_cuda_flash_attn_ext_qsa_streams(ctx, dst, ggml_cuda_flash_attn_ext_qsa_decode);
         return;
     }
     if (ggml_cuda_flash_attn_ext_qsa_prefill_supported(ctx.device, dst)) {
-        ggml_cuda_flash_attn_ext_qsa_prefill(ctx, dst);
+        ggml_cuda_flash_attn_ext_qsa_streams(ctx, dst, ggml_cuda_flash_attn_ext_qsa_prefill);
         return;
     }
 #endif
