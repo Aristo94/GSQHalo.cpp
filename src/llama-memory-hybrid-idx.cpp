@@ -1055,10 +1055,17 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
 
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const {
     if (qsa_prefix_matches(ubatch)) { return true; }
-    if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id ||
-            ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
-    // one stream: every seq id of the ubatch reads the same cells
-    return qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[0][0]), get_idx()->get_n_kv(), ratio, ubatch);
+    const uint32_t n_stream = get_n_stream();
+    if (!get_idx() || !ubatch.token || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id || ubatch.n_tokens % n_stream) { return false; }
+    // one stream: every seq id of the ubatch reads the same cells. Several streams (no -kvu): the tokens
+    // [s*n_tps, (s+1)*n_tps) read stream s, which holds only their sequence
+    const uint32_t n_tps = ubatch.n_tokens / n_stream;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (ubatch.n_seq_id[s*n_tps]<1 || !ubatch.seq_id[s*n_tps]) { return false; }
+        const auto & cells = mem->get_mem_idx()->get_cells(ubatch.seq_id[s*n_tps][0]);
+        if (!qsa_scalar_visibility_cells(cells, get_idx()->get_n_kv(), ratio, ubatch)) { return false; }
+    }
+    return true;
 }
 
 void llama_memory_hybrid_idx::qsa_invalidate() {
