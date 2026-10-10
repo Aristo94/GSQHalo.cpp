@@ -3,7 +3,7 @@
 typedef short qd_half16 __attribute__((ext_vector_type(16)));
 typedef float qd_float8 __attribute__((ext_vector_type(8)));
 
-static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
+template<bool Q8> static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         const char * q, const char * k, const char * v, const char * mask, const char * ids,
         size_t q1, size_t q2, size_t k1, size_t k2, size_t v1, size_t v2, size_t m1, size_t i1,
         int nk, int ns, int nh, int splits, int chunk, float scale, float * partial) {
@@ -51,8 +51,17 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
             qd_half16 kf = {};
             const int key = keys[r];
             if (key >= 0 && key < nk) {
-                const uint16_t * src = (const uint16_t *) (k + key*k1 + kvh*k2) + 32*w+16*t;
-                kf = __builtin_bit_cast(qd_half16, (uint4[2]){*(const uint4 *)src, *(const uint4 *)(src+8)});
+                if constexpr (Q8) {
+                    // dims 32w+16t..+15 lie in Q8_0 block w
+                    const block_q8_0 * b = (const block_q8_0 *) (k + key*k1 + kvh*k2) + w;
+                    uint16_t h[16];
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) { h[j] = qsa_q8_0_h(b, 16*t+j); }
+                    kf = __builtin_bit_cast(qd_half16, h);
+                } else {
+                    const uint16_t * src = (const uint16_t *) (k + key*k1 + kvh*k2) + 32*w+16*t;
+                    kf = __builtin_bit_cast(qd_half16, (uint4[2]){*(const uint4 *)src, *(const uint4 *)(src+8)});
+                }
             }
             scores = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, qf[t], scores);
         }
@@ -100,7 +109,11 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
                 const int key = keys[j];
-                values[j] = key >= 0 && key < nk ? *((const uint16_t *)(v+key*v1+kvh*v2)+32*w+16*t+r) : 0;
+                if constexpr (Q8) {
+                    values[j] = key >= 0 && key < nk ? qsa_q8_0_h((const block_q8_0 *)(v+key*v1+kvh*v2)+w, 16*t+r) : 0;
+                } else {
+                    values[j] = key >= 0 && key < nk ? *((const uint16_t *)(v+key*v1+kvh*v2)+32*w+16*t+r) : 0;
+                }
             }
             const qd_half16 vf = __builtin_bit_cast(qd_half16,values);
 #pragma unroll

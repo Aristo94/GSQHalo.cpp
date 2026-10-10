@@ -346,8 +346,12 @@ llama_kv_cache::llama_kv_cache(
             attn_rot_k = true;
         }
 
+        // qwen4exp keeps V unrotated. StrixLlama measured this model with a Q8_0 cache: mean KLD against f16 0.0139
+        // with K rotated alone, 0.0137 with both; with V rotated, a conversation restored from its disk tier parted from
+        // the resident one (the inverse rotation spreads last-bit differences of the P*V sums over the head)
         attn_rot_v =
             !attn_rot_disable &&
+            model.arch != LLM_ARCH_QWEN4EXP &&
             !attn_rot_v_rocmfpx_fp3 &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&

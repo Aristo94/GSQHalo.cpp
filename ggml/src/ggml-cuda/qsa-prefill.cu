@@ -2,6 +2,7 @@
 #if defined(GGML_USE_HIP)
 #include "common.cuh"
 #include "qsa-prefill.cuh"
+#include "qsa-decode.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -566,20 +567,20 @@ template<bool DIRECT, typename blk_t> __global__ __launch_bounds__(256) void qsa
 #endif
 }
 
-bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(int device, const ggml_tensor * dst) {
     const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
     if (!q || !k || !v || !ids || dst->src[4] || ggml_get_op_params_i32(dst, 4) != 0 ||
-            !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) return false;
+            !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) return false;
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params+4, 4); memcpy(&softcap, (const char *) dst->op_params+8, 4);
     // the mask is optional: a maskless op relies on the index rows naming only visible cells (-1 elsewhere)
     if (m && (m->type!=GGML_TYPE_F16 || m->nb[0]!=2 || m->ne[0]<k->ne[1] || m->ne[1]<q->ne[1] || m->ne[2]!=1 || m->ne[3]!=1)) return false;
-    return bias==0 && softcap==0 && q->type==GGML_TYPE_F32 && k->type==GGML_TYPE_F16 && v->type==GGML_TYPE_F16 &&
+    return bias==0 && softcap==0 && q->type==GGML_TYPE_F32 && qsa_kv_type_supported(k) && v->type==k->type && qsa_kv_type_supported(v) &&
         dst->type==GGML_TYPE_F32 && ids->type==GGML_TYPE_I32 &&
         q->ne[0]==256 && k->ne[0]==256 && v->ne[0]==256 && q->ne[1]>=128 && q->ne[1]<=INT_MAX &&
         k->ne[1]>0 && k->ne[1]<=GGML_FLASH_ATTN_EXT_TOP_K_MAX_KV && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
         k->ne[2]>0 && k->ne[2]<=65535 && q->ne[2]==12*k->ne[2] && v->ne[2]==k->ne[2] &&
         q->ne[3]==1 && k->ne[3]==1 && v->ne[3]==1 &&
-        q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 &&
+        q->nb[0]==4 && ids->nb[0]==4 &&
         q->nb[1]%16==0 && q->nb[2]%16==0 && uintptr_t(q->data)%16==0 &&
         k->nb[1]%16==0 && k->nb[2]%16==0 && uintptr_t(k->data)%16==0 &&
         ids->nb[1]%4==0 && uintptr_t(ids->data)%4==0 && ids->ne[0]>0 && ids->ne[0]<=2560 &&
@@ -607,6 +608,29 @@ static __global__ void qsa_pack_v(const char * src, uint16_t * dst, size_t nb1, 
     *reinterpret_cast<ushort4 *>(dst+group*1024+d*4)=make_ushort4(
         *reinterpret_cast<const uint16_t *>(in), *reinterpret_cast<const uint16_t *>(in+nb1),
         *reinterpret_cast<const uint16_t *>(in+2*nb1), *reinterpret_cast<const uint16_t *>(in+3*nb1));
+}
+
+// the same layouts from a Q8_0 cache, dequantized on the way (qsa_q8_0_h, as the decode kernels read it)
+static __global__ void qsa_pack_k_q8_0(const char * src, uint16_t * dst, size_t nb1, size_t nb2, int nk) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=uint32_t(nk)*32) return;
+    const uint32_t d=(i%32)*8, key=i/32, head=blockIdx.y;
+    const size_t group=size_t(head)*(nk/4)+key/4;
+    const auto * b=reinterpret_cast<const block_q8_0 *>(src+size_t(head)*nb2+size_t(key)*nb1)+d/32;
+    uint16_t h[8];
+#pragma unroll
+    for (int j=0;j<8;++j) h[j]=qsa_q8_0_h(b,d%32+j);
+    *reinterpret_cast<uint4 *>(dst+group*1024+(d/16)*64+(key%4)*16+d%16)=__builtin_bit_cast(uint4,h);
+}
+
+static __global__ void qsa_pack_v_q8_0(const char * src, uint16_t * dst, size_t nb1, size_t nb2, int nk) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=uint32_t(nk)*64) return;
+    const uint32_t d=i%256, head=blockIdx.y, key=(i/256)*4;
+    const size_t group=size_t(head)*(nk/4)+i/256;
+    const char * in=src+size_t(head)*nb2+size_t(key)*nb1;
+    const auto at=[&](const int j) { return qsa_q8_0_h(reinterpret_cast<const block_q8_0 *>(in+j*nb1)+d/32,d%32); };
+    *reinterpret_cast<ushort4 *>(dst+group*1024+d*4)=make_ushort4(at(0),at(1),at(2),at(3));
 }
 
 // QSA_STATS=1: per call, the size of the per-group union against a single query's selection (both in blocks), the
@@ -719,14 +743,16 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     // The direct V gather (four 2-byte loads per dim and block) costs ~2.5 ns per (query, union block), the pack
     // ~29 ns per key (gfx1151, 128K: 4096 queries x ~1360 union blocks -> attention 40 -> 27 ms/layer for a 3.9 ms
     // pack), so direct only pays off for ubatches below ~nk/128 queries.
+    // The direct path reads f16 rows; a Q8_0 cache is always dequantized by the pack.
     static const int qsa_direct_cfg = getenv("QSA_DIRECT") ? atoi(getenv("QSA_DIRECT")) : -1;
-    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 128 < (size_t) nk);
+    const bool q8 = k->type == GGML_TYPE_Q8_0;
+    const bool qsa_direct = !q8 && (qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 128 < (size_t) nk));
     ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_direct ? 0 : ggml_nelements(k));
     ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
     if (!qsa_direct) {
         const uint32_t count_k=uint32_t(nk)*32, count_v=uint32_t(nk)*64;   // per head
-        qsa_pack_k<<<dim3((count_k+255)/256,k->ne[2]),256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk);
-        qsa_pack_v<<<dim3((count_v+255)/256,v->ne[2]),256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk);
+        (q8 ? qsa_pack_k_q8_0 : qsa_pack_k)<<<dim3((count_k+255)/256,k->ne[2]),256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk);
+        (q8 ? qsa_pack_v_q8_0 : qsa_pack_v)<<<dim3((count_v+255)/256,v->ne[2]),256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk);
         CUDA_CHECK(cudaGetLastError());
     }
     const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
