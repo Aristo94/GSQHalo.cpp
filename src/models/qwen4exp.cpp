@@ -1080,22 +1080,25 @@ public:
 class llm_graph_input_qsa_cache : public llm_graph_input_i {
 public:
     llm_graph_input_qsa_cache(const llama_memory_hybrid_idx_context * mctx, int il, bool active, bool fast) :
-        mctx(mctx), il(il), active(active), fast(fast) {}
-    void set_input(const llama_ubatch *) override {
+        mctx(mctx), il(il), active(active), fast(fast), stream0(mctx->qsa_stream0()) {}
+    void set_input(const llama_ubatch * ubatch) override {
         if (!active) { return; }
-        if (fast) { mctx->qsa_fill_updates(members, positions, rows); }
-        mctx->qsa_commit(il);
+        if (fast) { mctx->qsa_fill_updates(members, positions, rows, *ubatch); }
+        mctx->qsa_commit(il, *ubatch);
     }
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
-        return mctx->qsa_prefix_matches(params.ubatch) == active &&
+        // the cache view in the graph starts at the first stream of the ubatch it was built for
+        const int64_t n_stream = mctx->get_n_stream();
+        return mctx->qsa_stream0() == stream0 && mctx->qsa_prefix_matches(params.ubatch) == active &&
             (!active || mctx->qsa_fast(il, params.ubatch) == fast) &&
-            (!fast || rows->ne[0] == (params.ubatch.n_tokens+3)/4+2);
+            (!fast || (rows->ne[1] == n_stream && rows->ne[0] == (params.ubatch.n_tokens/n_stream+3)/4+2));
     }
     const llama_memory_hybrid_idx_context * mctx;
     int il;
     bool active;
     bool fast;
+    uint32_t stream0;
     ggml_tensor * members = nullptr;
     ggml_tensor * positions = nullptr;
     ggml_tensor * rows = nullptr;
@@ -1215,19 +1218,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    ggml_tensor * storage = r == 4 && blk_bias && cparams.causal_attn && n_stream == 1 ? mctx_hyb->qsa_cache(ctx0, il) : nullptr;
+    // the pooled keys of every stream of the ubatch, [idx_dim, blocks+1, n_stream]
+    ggml_tensor * storage = r == 4 && blk_bias && cparams.causal_attn ? mctx_hyb->qsa_cache(ctx0, il) : nullptr;
     ggml_tensor * cached = storage && mctx_hyb->qsa_prefix_matches(ubatch) ? storage : nullptr;
     const bool fast_cache = cached && mctx_hyb->qsa_fast(il, ubatch);
-    const int64_t prep_blocks = fast_cache ? (n_tokens+3)/4+2 : n_blocks;
+    const int64_t prep_blocks = fast_cache ? (n_tps+3)/4+2 : n_blocks;
     ggml_tensor * member_rows = inp->blk_cells;
     ggml_tensor * block_positions = inp->blk_pos;
     ggml_tensor * cache_rows = nullptr;
     if (storage) {
         auto cache_input = std::make_unique<llm_graph_input_qsa_cache>(mctx_hyb, il, cached != nullptr, fast_cache);
         if (fast_cache) {
-            member_rows = cache_input->members = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*prep_blocks);
-            block_positions = cache_input->positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*prep_blocks);
-            cache_rows = cache_input->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, prep_blocks);
+            member_rows = cache_input->members = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*prep_blocks, n_stream);
+            block_positions = cache_input->positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*prep_blocks*n_stream);
+            cache_rows = cache_input->rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I64, prep_blocks, n_stream);
             ggml_set_input(member_rows); ggml_set_input(block_positions); ggml_set_input(cache_rows);
         }
         res->add_input(std::move(cache_input));
@@ -1258,11 +1262,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     };
     ggml_tensor * pooled = prepare_keys(member_rows, block_positions, prep_blocks);
     if (cached) {
-        auto * prepared = ggml_reshape_2d(ctx0, pooled, idx_dim, prep_blocks);
-        auto * destination = fast_cache ? cached : ggml_view_2d(ctx0, cached, idx_dim, n_blocks, cached->nb[1], 0);
-        auto * written = fast_cache ? ggml_set_rows(ctx0, destination, prepared, cache_rows) : ggml_cpy(ctx0, prepared, destination);
+        auto * destination = fast_cache ? cached : ggml_view_3d(ctx0, cached, idx_dim, n_blocks, n_stream, cached->nb[1], cached->nb[2], 0);
+        auto * written = fast_cache ? ggml_set_rows(ctx0, destination, pooled, cache_rows) : ggml_cpy(ctx0, pooled, destination);
         ggml_build_forward_expand(gf, written);
-        pooled = ggml_view_3d(ctx0, written, idx_dim, n_blocks, 1, written->nb[1], written->nb[1]*n_blocks, 0);
+        pooled = ggml_view_3d(ctx0, written, idx_dim, n_blocks, n_stream, written->nb[1], written->nb[2], 0);
         cb(pooled, "indexer_k_cached", il);
     }
     cb(pooled, "indexer_k", il);

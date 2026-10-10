@@ -1,7 +1,7 @@
 #pragma once
 
 #include "llama-memory-hybrid.h"
-#include "qsa-prefix-state.h"
+#include "qsa-streams.h"
 
 #include <memory>
 #include <vector>
@@ -108,9 +108,10 @@ public:
     void qsa_invalidate();
     bool qsa_prefix_matches(const llama_ubatch & ubatch) const;
     bool qsa_fast(int il, const llama_ubatch & ubatch) const;
-    ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks) const;
-    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
-    void qsa_commit(int il) const;
+    // the pooled keys of streams [s0, s0+ns): [idx_dim, blocks+1, ns]
+    ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks, uint32_t s0, uint32_t ns) const;
+    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows, const llama_ubatch & ubatch) const;
+    void qsa_commit(int il, const llama_ubatch & ubatch) const;
 
 private:
     // closed-form metadata for an incremental ubatch on the tracked prefix; false when the scan is needed
@@ -127,11 +128,10 @@ private:
                       ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
 
     bool incremental_qsa = false;
-    bool qsa_recover_pending = false;
-    bool qsa_recover(llama_seq_id seq);
-    qsa_prefix_state qsa_prefix;
-    mutable std::vector<int64_t> qsa_ready;
-    std::vector<ggml_tensor *> qsa_keys;
+    // rebuild the prefix of stream st from the cells of seq
+    bool qsa_recover(uint32_t st, llama_seq_id seq);
+    qsa_streams qsa;
+    std::vector<ggml_tensor *> qsa_keys;   // F32 [idx_dim, (kv_size+3)/4 + 1, n_stream] per layer
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_buffers;
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -189,11 +189,15 @@ public:
     // run ahead of its cells (an MTP draft never receives the image cells an M-RoPE image pins to one position)
     // has blocks past that view. Never below get_n_kv(), padded like it so graph reuse keeps its cadence.
     uint32_t qsa_n_kv_window() const;
+    // first stream of the current ubatch: its streams are [qsa_stream0(), qsa_stream0() + get_n_stream())
+    uint32_t qsa_stream0() const { return i_cur < qsa_slots.size() ? qsa_slots[i_cur].s0 : 0; }
     ggml_tensor * qsa_cache(ggml_context * ctx, int il) const {
-        return mem ? mem->qsa_cache(ctx, il, (qsa_n_kv_window()+3)/4) : nullptr;
+        return mem ? mem->qsa_cache(ctx, il, (qsa_n_kv_window()+3)/4, qsa_stream0(), get_n_stream()) : nullptr;
     }
-    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * pos, ggml_tensor * rows) const { mem->qsa_fill_updates(members, pos, rows); }
-    void qsa_commit(int il) const { mem->qsa_commit(il); }
+    void qsa_fill_updates(ggml_tensor * members, ggml_tensor * pos, ggml_tensor * rows, const llama_ubatch & u) const {
+        mem->qsa_fill_updates(members, pos, rows, u);
+    }
+    void qsa_commit(int il, const llama_ubatch & u) const { mem->qsa_commit(il, u); }
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
