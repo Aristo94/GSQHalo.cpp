@@ -9655,11 +9655,15 @@ struct test_qsa_prefill : public test_case {
     const int dim, queries, keys, selected, streams, ratio;
     const bool interleaved, poison;
     bool spread = false;   // see qsa_spread()
+    ggml_type type_kv = GGML_TYPE_F16;   // see qsa_q8_0()
     ggml_tensor * q = nullptr, * k = nullptr, * v = nullptr, * mask = nullptr, * ids = nullptr;
     test_qsa_prefill(int queries, int keys, int selected, bool interleaved=true, bool poison=false, int streams=1, int ratio=12, int dim=256)
         : dim(dim), queries(queries), keys(keys), selected(selected), streams(streams), ratio(ratio), interleaved(interleaved), poison(poison) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL"; }
-    std::string vars() override { return VARS_TO_STR8(dim,queries,keys,selected,streams,ratio,interleaved,poison) + (spread ? ",spread=1" : ""); }
+    std::string vars() override {
+        return VARS_TO_STR8(dim,queries,keys,selected,streams,ratio,interleaved,poison) + (spread ? ",spread=1" : "") +
+            (type_kv != GGML_TYPE_F16 ? std::string(",type_kv=") + ggml_type_name(type_kv) : "");
+    }
     // the key of pick j of a query row; spread: the picks cover the whole key range, plus the last key and key 4*65535
     // (block 65535, the 16-bit pad value of the old union) in every row
     int pick(int j, int query, int stream) const {
@@ -9673,8 +9677,8 @@ struct test_qsa_prefill : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
         q = ggml_permute(ctx,q,0,2,1,3);
-        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
-        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        k = ggml_new_tensor_4d(ctx,type_kv,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        v = ggml_new_tensor_4d(ctx,type_kv,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
         if (interleaved) { k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3); }
         mask = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,keys,queries,1,streams);
         ids = ggml_new_tensor_4d(ctx,GGML_TYPE_I32,selected,queries,1,streams);
@@ -9702,6 +9706,7 @@ struct test_qsa_prefill : public test_case {
         ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
         ggml_backend_tensor_set(mask,masks.data(),0,ggml_nbytes(mask));
         if (poison) {
+            GGML_ASSERT(type_kv == GGML_TYPE_F16);
             std::vector<ggml_fp16_t> nan(dim,ggml_fp32_to_fp16(NAN));
             for (auto * t : {k,v}) for (int stream=0;stream<streams;++stream) for (int head=0;head<2;++head) {
                 ggml_backend_tensor_set(t,nan.data(),stream*t->nb[3]+head*t->nb[2]+3*t->nb[1],dim*sizeof(ggml_fp16_t));
@@ -9769,8 +9774,8 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
         q = ggml_permute(ctx,q,0,2,1,3);
-        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
-        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        k = ggml_new_tensor_4d(ctx,type_kv,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        v = ggml_new_tensor_4d(ctx,type_kv,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
         if (interleaved) { k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3); }
         mask = nullptr;
         ids = ggml_new_tensor_4d(ctx,GGML_TYPE_I32,selected,queries,1,streams);
@@ -9834,6 +9839,8 @@ struct test_qsa_decode_maskless : public test_qsa_prefill_maskless {
 
 // selected keys beyond 2^18 (a unified multi-slot cache): picks over the whole range, see test_qsa_prefill::pick
 template<typename T> static T * qsa_spread(T * t) { t->spread = true; return t; }
+// a Q8_0 K/V cache (-ctk q8_0 -ctv q8_0)
+template<typename T> static T * qsa_q8_0(T * t) { t->type_kv = GGML_TYPE_Q8_0; return t; }
 
 // Complete-block selection as qwen4exp_select_complete_blocks builds it (512-block budget, ratio 4): the HIP
 // backend fuses the whole subgraph into one kernel; the CPU computes it node by node. Exact integer comparison.
@@ -13863,6 +13870,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(qsa_spread(new test_qsa_prefill(2052,262400,257)));
     test_cases.emplace_back(qsa_spread(new test_qsa_prefill_maskless(2052,262400,257)));
     test_cases.emplace_back(qsa_spread(new test_qsa_prefill_maskless(3128,400000,257)));
+    // Q8_0 K/V: the decode kernels read the selected Q8_0 rows, qsa_prefill dequantizes K/V in its pack. 640 queries over
+    // 135168 or 262400 keys would read f16 K/V directly (< keys/128 queries); Q8_0 must take the pack there too
+    for (int q : {1,8,64,512}) test_cases.emplace_back(qsa_q8_0(new test_qsa_decode(q,4096,2051)));
+    test_cases.emplace_back(qsa_q8_0(new test_qsa_decode(9,4096,257,false,4)));                  // SIMT kernel (GQA 4)
+    test_cases.emplace_back(qsa_q8_0(new test_qsa_decode(9,4096,2051,false,12,false,false)));    // K/V not interleaved
+    test_cases.emplace_back(qsa_q8_0(new test_qsa_decode_maskless(64,4096,2051)));
+    test_cases.emplace_back(qsa_q8_0(new test_qsa_decode_maskless(9,4096,257,4)));
+    for (bool interleaved : {false,true}) test_cases.emplace_back(qsa_q8_0(new test_qsa_prefill(513,4096,257,interleaved)));
+    test_cases.emplace_back(qsa_q8_0(new test_qsa_prefill(640,40064,2051)));
+    test_cases.emplace_back(qsa_q8_0(new test_qsa_prefill_maskless(513,4096,2051)));
+    test_cases.emplace_back(qsa_q8_0(new test_qsa_prefill_maskless(640,135168,2051)));
+    test_cases.emplace_back(qsa_spread(qsa_q8_0(new test_qsa_prefill_maskless(640,262400,2051))));
     for (int n_blocks : {512, 700, 2048}) for (int n_query : {1, 3, 9, 64, 127, 130}) test_cases.emplace_back(new test_qsa_expand(n_blocks, n_query));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,4));
