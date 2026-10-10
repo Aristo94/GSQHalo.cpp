@@ -9652,7 +9652,9 @@ struct test_flash_attn_ext_top_k : public test_case {
 };
 
 struct test_qsa_prefill : public test_case {
-    const int dim, queries, keys, selected, streams, ratio;
+    const int dim, queries, keys, selected;
+    int streams;   // see qsa_streams()
+    const int ratio;
     const bool interleaved, poison;
     bool spread = false;   // see qsa_spread()
     ggml_type type_kv = GGML_TYPE_F16;   // see qsa_q8_0()
@@ -9726,28 +9728,29 @@ struct test_qsa_decode : public test_qsa_prefill {
         if (queries>512 || selected>2560) return agreement;   // 512 = QSA_DECODE_MAX_QUERIES (ggml-cuda/qsa-decode.cuh)
         const auto qv=tensor_to_float(q), kv=tensor_to_float(k), vv=tensor_to_float(v), mv=tensor_to_float(mask);
         std::vector<float> reference(n);
-        for (int query=0;query<queries;++query) {
+        for (int stream=0;stream<streams;++stream) for (int query=0;query<queries;++query) {
+            const size_t row=size_t(stream)*queries+query;
             std::vector<int> active;
-            for (int key=0;key<keys;++key) if (mv[size_t(query)*keys+key]!=-INFINITY) active.push_back(key);
+            for (int key=0;key<keys;++key) if (mv[row*keys+key]!=-INFINITY) active.push_back(key);
             for (int head=0;head<2*ratio;++head) {
                 std::vector<double> scores(active.size()), values(dim,0.0);
                 double maximum=-INFINITY;
                 for (size_t j=0;j<active.size();++j) {
                     const int key=active[j];double dot=0;
-                    for (int d=0;d<dim;++d) dot+=double(qv[d+size_t(dim)*(query+queries*head)])*kv[d+size_t(dim)*(key+keys*(head/ratio))];
-                    scores[j]=dot/std::sqrt(double(dim))+mv[size_t(query)*keys+key];
+                    for (int d=0;d<dim;++d) dot+=double(qv[d+size_t(dim)*(query+queries*(head+2*ratio*stream))])*kv[d+size_t(dim)*(key+keys*(head/ratio+2*stream))];
+                    scores[j]=dot/std::sqrt(double(dim))+mv[row*keys+key];
                     maximum=std::max(maximum,scores[j]);
                 }
                 double sum=0;
                 for (size_t j=0;j<active.size();++j) {
                     const double weight=std::exp(scores[j]-maximum);sum+=weight;
-                    for (int d=0;d<dim;++d) values[d]+=weight*vv[d+size_t(dim)*(active[j]+keys*(head/ratio))];
+                    for (int d=0;d<dim;++d) values[d]+=weight*vv[d+size_t(dim)*(active[j]+keys*(head/ratio+2*stream))];
                 }
-                for (int d=0;d<dim;++d) reference[d+size_t(dim)*(head+2*ratio*query)]=sum>0 ? float(values[d]/sum) : 0.0f;
+                for (int d=0;d<dim;++d) reference[d+size_t(dim)*(head+2*ratio*row)]=sum>0 ? float(values[d]/sum) : 0.0f;
             }
         }
         const double gpu_error=nmse(reference.data(),actual,n), cpu_error=nmse(reference.data(),cpu,n);
-        fprintf(stderr,"QSA_FP64 q=%d keys=%d selected=%d ratio=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,ratio,gpu_error,cpu_error);
+        fprintf(stderr,"QSA_FP64 q=%d keys=%d selected=%d ratio=%d streams=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,ratio,streams,gpu_error,cpu_error);
         return std::max(agreement,gpu_error);
     }
     void initialize_tensors(ggml_context * ctx) override {
@@ -9755,9 +9758,10 @@ struct test_qsa_decode : public test_qsa_prefill {
         if (!duplicates) return;
         std::vector<int32_t> picks(ggml_nelements(ids));
         std::vector<ggml_fp16_t> masks(ggml_nelements(mask),ggml_fp32_to_fp16(-INFINITY));
-        for (int q=0;q<queries;++q) for (int j=0;j<selected;++j) {
-            const int key=j<selected/2 ? 2 : 4+(j*13+q*7)%(keys-8);
-            picks[q*selected+j]=key;masks[q*keys+key]=ggml_fp32_to_fp16(0.f);
+        for (int stream=0;stream<streams;++stream) for (int q=0;q<queries;++q) for (int j=0;j<selected;++j) {
+            const int key=j<selected/2 ? 2 : 4+(j*13+q*7+stream*5)%(keys-8);
+            const int row=stream*queries+q;
+            picks[row*selected+j]=key;masks[row*keys+key]=ggml_fp32_to_fp16(0.f);
         }
         ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
         ggml_backend_tensor_set(mask,masks.data(),0,ggml_nbytes(mask));
@@ -9789,13 +9793,13 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
             if (t->op==GGML_OP_NONE && t!=ids) init_tensor_uniform(t);
         }
         std::vector<int32_t> picks(ggml_nelements(ids));
-        for (int q=0;q<queries;++q) {
+        for (int stream=0;stream<streams;++stream) for (int q=0;q<queries;++q) {
             for (int j=0;j<selected;++j) {
-                int key=pick(j,q,0);
+                int key=pick(j,q,stream);
                 if (j==0) key=selected==1 ? 2 : -1;      // -1: an invisible block's cell
                 if (j==1) key=2;
                 if (j>selected-3 && selected>4) key=-1;  // tail padding
-                picks[q*selected+j]=key;
+                picks[(stream*queries+q)*selected+j]=key;
             }
         }
         ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
@@ -9805,29 +9809,30 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
         std::vector<int32_t> picks(ggml_nelements(ids));
         ggml_backend_tensor_get(ids,picks.data(),0,ggml_nbytes(ids));
         std::vector<float> reference(n);
-        for (int query=0;query<queries;++query) {
+        for (int stream=0;stream<streams;++stream) for (int query=0;query<queries;++query) {
+            const size_t row=size_t(stream)*queries+query;
             std::vector<int> active;
-            for (int j=0;j<selected;++j) { const int key=picks[query*selected+j]; if (key>=0 && key<keys && std::find(active.begin(),active.end(),key)==active.end()) active.push_back(key); }
+            for (int j=0;j<selected;++j) { const int key=picks[row*selected+j]; if (key>=0 && key<keys && std::find(active.begin(),active.end(),key)==active.end()) active.push_back(key); }
             for (int head=0;head<2*ratio;++head) {
                 std::vector<double> scores(active.size()), values(dim,0.0);
                 double maximum=-INFINITY;
                 for (size_t j=0;j<active.size();++j) {
                     const int key=active[j];double dot=0;
-                    for (int d=0;d<dim;++d) dot+=double(qv[d+size_t(dim)*(query+queries*head)])*kv[d+size_t(dim)*(key+keys*(head/ratio))];
+                    for (int d=0;d<dim;++d) dot+=double(qv[d+size_t(dim)*(query+queries*(head+2*ratio*stream))])*kv[d+size_t(dim)*(key+keys*(head/ratio+2*stream))];
                     scores[j]=dot/std::sqrt(double(dim));
                     maximum=std::max(maximum,scores[j]);
                 }
                 double sum=0;
                 for (size_t j=0;j<active.size();++j) {
                     const double weight=std::exp(scores[j]-maximum);sum+=weight;
-                    for (int d=0;d<dim;++d) values[d]+=weight*vv[d+size_t(dim)*(active[j]+keys*(head/ratio))];
+                    for (int d=0;d<dim;++d) values[d]+=weight*vv[d+size_t(dim)*(active[j]+keys*(head/ratio+2*stream))];
                 }
-                for (int d=0;d<dim;++d) reference[d+size_t(dim)*(head+2*ratio*query)]=sum>0 ? float(values[d]/sum) : 0.0f;
+                for (int d=0;d<dim;++d) reference[d+size_t(dim)*(head+2*ratio*row)]=sum>0 ? float(values[d]/sum) : 0.0f;
             }
         }
         const double gpu_error=nmse(reference.data(),actual,n);
         const double cpu_error=nmse(reference.data(),cpu,n);
-        fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,gpu_error,cpu_error);
+        fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d streams=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,streams,gpu_error,cpu_error);
         return std::max(gpu_error,cpu_error);
     }
 };
@@ -9841,6 +9846,8 @@ struct test_qsa_decode_maskless : public test_qsa_prefill_maskless {
 template<typename T> static T * qsa_spread(T * t) { t->spread = true; return t; }
 // a Q8_0 K/V cache (-ctk q8_0 -ctv q8_0)
 template<typename T> static T * qsa_q8_0(T * t) { t->type_kv = GGML_TYPE_Q8_0; return t; }
+// one K/V stream per sequence (no -kvu): q, K/V, mask and ids carry the streams in ne[3]
+template<typename T> static T * qsa_streams(T * t, int streams) { t->streams = streams; return t; }
 
 // Complete-block selection as qwen4exp_select_complete_blocks builds it (512-block budget, ratio 4): the HIP
 // backend fuses the whole subgraph into one kernel; the CPU computes it node by node. Exact integer comparison.
@@ -13826,7 +13833,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // QSA_PREFILL cases with <= 512 queries run on qsa_decode (fattn tries it first); qsa_prefill itself is covered by
-    // the > 512 cases below and by the multi-stream case (which qsa_decode rejects)
+    // the > 512 cases below
     for (bool interleaved : {false,true}) {
         test_cases.emplace_back(new test_qsa_prefill(128,512,17,interleaved));
         test_cases.emplace_back(new test_qsa_prefill(129,4096,257,interleaved));
@@ -13882,6 +13889,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(qsa_q8_0(new test_qsa_prefill_maskless(513,4096,2051)));
     test_cases.emplace_back(qsa_q8_0(new test_qsa_prefill_maskless(640,135168,2051)));
     test_cases.emplace_back(qsa_spread(qsa_q8_0(new test_qsa_prefill_maskless(640,262400,2051))));
+    for (int s : {2,4}) for (int q : {1,8}) test_cases.emplace_back(qsa_streams(new test_qsa_decode(q,4096,2051),s));
+    test_cases.emplace_back(qsa_streams(new test_qsa_decode(9,4096,257,false,4),2));                  // SIMT kernel (GQA 4)
+    test_cases.emplace_back(qsa_streams(new test_qsa_decode(8,4096,2051,false,12,false,false),2));    // K/V not interleaved
+    test_cases.emplace_back(qsa_streams(new test_qsa_decode(8,4096,2051,false,12,true),2));           // duplicate picks
+    test_cases.emplace_back(qsa_streams(new test_qsa_decode(8,4096,257,true),2));
+    test_cases.emplace_back(qsa_streams(qsa_q8_0(new test_qsa_decode(8,4096,2051)),2));
+    for (int q : {1,64}) test_cases.emplace_back(qsa_streams(new test_qsa_decode_maskless(q,4096,2051),4));
+    test_cases.emplace_back(qsa_streams(new test_qsa_decode_maskless(9,4096,257,4),2));
+    test_cases.emplace_back(qsa_streams(new test_qsa_prefill(513,4096,257),2));
+    test_cases.emplace_back(qsa_streams(new test_qsa_prefill(640,4096,257,true,true),2));
+    test_cases.emplace_back(qsa_streams(new test_qsa_prefill_maskless(513,4096,2051),2));
+    test_cases.emplace_back(qsa_streams(qsa_q8_0(new test_qsa_prefill_maskless(513,4096,2051)),2));
     for (int n_blocks : {512, 700, 2048}) for (int n_query : {1, 3, 9, 64, 127, 130}) test_cases.emplace_back(new test_qsa_expand(n_blocks, n_query));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,4));
