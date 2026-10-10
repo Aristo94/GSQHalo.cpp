@@ -1051,8 +1051,13 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
     // a unified cache maps every seq id to stream 0; otherwise seq s is stream s and seq_to_stream holds n_stream ids.
     // this is the stream count of the cache: get_n_stream() counts the streams of the ubatch, 1 for a single slot
     const uint32_t n_stream = mem->get_mem_idx()->get_n_stream();
-    const llama_seq_id n_seq_scan = n_stream == 1 ? (llama_seq_id) LLAMA_MAX_SEQ : (llama_seq_id) n_stream;
-    for (llama_seq_id s = 0; s < n_seq_scan; ++s) {
+    // several streams: only the sequences of the ubatch's streams, so a short chat next to a long one scores
+    // its own blocks only (all streams for the reserve graph, which has no slot info)
+    llama_seq_id s_begin = 0, s_end = n_stream == 1 ? (llama_seq_id) LLAMA_MAX_SEQ : (llama_seq_id) n_stream;
+    if (n_stream > 1 && i_cur < qsa_slots.size()) {
+        s_begin = qsa_slots[i_cur].s0; s_end = qsa_slots[i_cur].s1 + 1;
+    }
+    for (llama_seq_id s = s_begin; s < s_end; ++s) {
         pos_max = std::max(pos_max, mem->get_mem_idx()->get_cells(s).seq_pos_max(s));
     }
     if (pos_max < 0) { return n_kv; }
