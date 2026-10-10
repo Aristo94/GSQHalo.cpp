@@ -13,6 +13,9 @@ Qwen3.8-Flash-Next on AMD Strix Halo (Ryzen AI Max+ 395, Radeon 8060S, `gfx1151`
   than 262 140 cells.
 - **A persistent KV cache on SSD.** This is the disk tier v3 of StrixLlama, ported to Linux without mmap. Conversations
   survive slot switches and server restarts.
+- **Four 256K chats.** A Q8_0 K/V cache for the QSA kernels halves the attention cache, and one KV stream per slot
+  (no `-kvu`) lets every chat read only its own cells. 4 × 256K with MTP fit in 96 GB, and a chat next to three
+  loaded ones decodes at 37 instead of 12 t/s.
 
 Everything else is halo-box/strix-llama.cpp at `307c50d` (PR #123). Its README as of that commit is in
 [docs/halo-box/README.md](../halo-box/README.md).
@@ -73,6 +76,20 @@ The full upstream history is included, and the GSQHalo commits sit on top of `30
 | Restore before write | `713ff4f` | | The writer pauses while a restore is reading, at most 10 s per object. |
 | State hash | `761a95d` | `STRIX_STATE_HASH=1` | Logs a hash of the state at task start, after every prompt batch and when a conversation leaves its slot. Debugging only. |
 | Coalesced device reads | `a51ae19` | | A state save reads neighbouring pieces of a tensor in one call instead of once per cell range. |
+
+**Q8_0 K/V cache and one KV stream per slot**
+
+| Change | Commit | Flag / switch | What it does |
+| --- | --- | --- | --- |
+| Q8_0 K/V for the QSA kernels | `c8c95aa` | `-ctk q8_0 -ctv q8_0` | QSA decode (WMMA and SIMT) dequantizes the selected Q8_0 rows while loading; QSA prefill packs them into the same f16 layouts. 262144 cells take 3.2 instead of 6 GiB. The indexer cache stays f16. |
+| Legacy pool releases outgrown buffers | `a939cf2` | | The HIP legacy pool kept every buffer a request had outgrown, so buffers that grow with the K/V depth piled up to about 20× the largest request. It now frees them when it has to allocate; CUDA graphs captured before a release are captured again. |
+| QSA kernels for several K/V streams | `6fb5a2f` | no `-kvu` | Without `-kvu` every slot has its own K/V stream (`ne[3]`). The QSA kernels run once per stream on single-stream views, so each stream gets exactly the single-stream result. |
+| Block selection with several streams | `106958d` | | Ubatches over several streams (several slots decoding at once) ran dense over all cells. They now take block selection and the maskless QSA path, with a per-stream f32 block bias. |
+| Disk tier rows per stream | `27182eb` | | The disk tier was off without `-kvu`. Its row API now reads the stream of the sequence. Entries written with `-kvu` also fit without it. |
+| Indexer-key cache per stream | `13b7b85` | | The incremental QSA path (indexer-key cache, block metadata in closed form) tracked one sequence for the whole cache and fell back to re-pooling all blocks after every slot switch. It now tracks every stream. |
+| Block window per ubatch | `df61765` | | The block count of a ubatch comes from the streams it touches, not from the deepest slot. |
+
+The tests come first in `5fac7e0` (Q8_0 cases) and `c67f66f` (several streams); both fail without the kernel commits.
 
 ## Results
 
@@ -169,6 +186,33 @@ prompt were sent at the same time.
 Before `5bc1d79`–`bf0890d`, the MTP-off run aborted at `n_kv` 262 400 (QSA limit), and the MTP-on run dropped below
 4 GiB available even at `-ub 4096`. Now the generated text is identical with and without MTP.
 
+### Four slots of 256K
+
+Server flags: `-c 1048576 -np 4 --kv-unified-per-slot 262144 -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 -ctxcp 4 --cache-ram 0`,
+MTP with a Q8_0 draft cache (`-ctkd q8_0 -ctvd q8_0`). Four 250K prompts, each with a needle, were sent at the same time.
+
+| | `-kvu` (one shared cache) | One stream per slot (`df61765`) |
+| --- | ---: | ---: |
+| All four prompts done after | 1367 s | **1034 s** |
+| Decode of the last chat, three others loaded | 12.1 t/s | **37.2 t/s** |
+| Needles found | 4/4 | **4/4** |
+| GTT after load / peak | | 73.9 / 74.9 GiB |
+| Lowest MemAvailable | | 8 GiB |
+
+Before the per-stream key cache (`13b7b85`, `df61765`), the last chat decoded at 19.5 t/s. `-ub 4096 -ctxcp 8` does not
+fit: 1.6 GiB were left after load, even with a Q8_0 draft cache.
+
+**Several slots decoding at once** (`llama-batched-bench`, 4 sequences, no MTP, q8_0 K/V), decode tokens/s of all four
+together:
+
+| Depth per sequence | Before `13b7b85` | After `df61765` |
+| ---: | ---: | ---: |
+| 16K | 53.7 | 57.6 (+7 %) |
+| 32K | 50.2 | 57.0 (+14 %) |
+
+**Two slots, no MTP, slot A at 128K and slot B at 2K** (`llama-server`): B alone 20.5 → 24.5 t/s, A alone 18.8 → 23.5
+t/s (one slot on its own: 23.9–24.2), both at once 27.4 → 35.8 t/s.
+
 ### Quality
 
 Perplexity over 32 × 4096 tokens of wikitext, base vs `19c97f4`, paired per chunk:
@@ -185,6 +229,14 @@ Most kernel changes are bit-identical (mean KLD exactly 0 against their predeces
 
 On this model, any rounding change lands near KLD 0.010, because top-k choices in QSA and in the MoE router flip.
 
+**Q8_0 K/V** (`c8c95aa`, wikitext 8 × 4096): PPL 3.3711 against 3.3755 with f16 K/V (−0.13 %, ± 0.053). KLD 0.0110 ±
+0.0006, against an f16 noise floor of 0.0104 ± 0.0004 (the same f16 cache with another ubatch size), i.e. 1.06× the
+floor; same top p 97.0 % (floor 97.3 %). Speed is the same as f16 (`llama-bench`, one stream): pp2048 1352 / 1232 t/s
+at depth 0 / 32K (f16 1301 / 1206), tg128 26.5 / 24.9 / 24.1 t/s at depth 0 / 32K / 128K (f16 26.7 / 25.0 / 24.1).
+
+The stream commits are bit-identical: 11 of 11 perplexity runs (4 streams × 4 corpora, small ubatches over 4 streams,
+`-kvu`, one stream) match their predecessor exactly.
+
 ### SSD prompt cache
 
 Server with 2 slots and MTP, ext4 on a USB SSD (~600 MB/s):
@@ -195,6 +247,9 @@ Server with 2 slots and MTP, ext4 on a USB SSD (~600 MB/s):
 - **Soak test:** two 89K-token conversations alternated in one slot for 10 rounds. Each restore took 5.4–5.5 s and the
   median switch 6.2 s. After a persist and a restart, 22/22 answers were correct.
 - **Oracle:** a restore after eviction or restart is bit-identical to the reference, with and without MTP.
+- **One stream per slot** (`27182eb`, 2 × 256K without `-kvu`, internal NVMe): a 24K-token conversation that left slot 0
+  came back from disk into slot 1, the other stream, in 0.37 s, and only 4 prompt tokens were processed. After a
+  restart, two conversations came back the same way; 7/7 needles were found.
 
 ## Quick start
 
@@ -236,14 +291,14 @@ llama-server \
   --jinja --reasoning on --reasoning-effort xhigh
 ```
 
-**Two slots of 256K, unified KV, idle conversations on SSD:**
+**Two slots of 256K, one KV stream per slot, idle conversations on SSD:**
 
 ```sh
 llama-server \
   -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
   -md mtp-head-Q8_0.gguf \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 \
-  -c 524288 -np 2 -kvu --kv-unified-per-slot 262144 \
+  -c 524288 -np 2 --kv-unified-per-slot 262144 \
   -ngl 999 -fa on -lm dio -lzm on-direct -t 4 -b 4096 -ub 4096 \
   --cache-ram 0 -ctxcp 8 --no-cache-idle-slots \
   --cache-dir /mnt/ssd/llama-cache --cache-dir-max 81920 \
@@ -251,6 +306,19 @@ llama-server \
 ```
 
 To save all idle conversations to disk before stopping the server, send `curl -X POST http://127.0.0.1:8080/strix/persist`.
+
+**Four slots of 256K, Q8_0 K/V, one KV stream per slot:**
+
+```sh
+llama-server \
+  -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
+  -md mtp-head-Q8_0.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.3 -ctkd q8_0 -ctvd q8_0 \
+  -c 1048576 -np 4 --kv-unified-per-slot 262144 -ctk q8_0 -ctv q8_0 \
+  -ngl 999 -fa on -lm dio -lzm on-direct -t 4 -b 2048 -ub 2048 \
+  --cache-ram 0 -ctxcp 4 \
+  --jinja --reasoning on --reasoning-effort xhigh
+```
 
 Tips for these configs:
 
@@ -261,6 +329,9 @@ Tips for these configs:
 - **Keep `-b 4096` on multi-slot servers.** With `-b 32768`, a long prompt in one slot stalls the decode of the other
   slots until it finishes.
 - **One slot with MTP:** `-b 8192 -ub 8192` gives the same prefill as `-b 32768` and uses less pinned host memory.
+- **Leave out `-kvu` on multi-slot servers.** With one KV stream per slot, every chat reads only its own cells, and a
+  long chat no longer slows down the others. `-kvu` puts all slots into one shared pool.
+- **Four slots of 256K need the lean flags.** `-ub 2048 -ctxcp 4` and a Q8_0 draft cache; `-ub 4096 -ctxcp 8` does not fit.
 
 ## Known limits
 
@@ -273,7 +344,8 @@ Tips for these configs:
   restores the old block order.
 - **The disk tier writes through on every full run** (4096 positions by default). Restore speed is bounded by the SSD;
   from a USB SSD at ~600 MB/s, an 89K-token conversation takes about 5.5 s.
-- **The multi-slot QSA fix has not been sent upstream yet.**
+- **Q8_0 K/V is not bit-identical to f16** (KLD 1.06× the f16 noise floor, see Quality). f16 stays the default.
+- **The multi-slot QSA fix and the legacy pool fix have not been sent upstream yet.**
 
 ## Credits
 

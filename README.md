@@ -24,7 +24,7 @@ hyper-connections are BF16. On the fork this builds on, those tensors ran on gen
 memory needed for a second long-context slot, and a server with two 256K slots crashed.
 
 GSQHalo.cpp fixes those three problems for this model on this hardware, and adds a KV cache on SSD that survives slot
-switches and restarts.
+switches and restarts. With a Q8_0 K/V cache and one KV stream per slot, four 256K chats with MTP fit in 96 GB.
 
 ## Results
 
@@ -53,8 +53,18 @@ from 1003 to about 1350 t/s. [The docs](docs/gsqhalo/README.md#results) give eve
 | Prefill with MTP, 128K prompt | 1193 t/s | **1386 t/s** |
 | 2 × 256K slots with MTP in 96 GB | ran out of memory | **runs, ≥ 8 GiB free** |
 
+**Four chats of 256K** (`llama-server`, MTP, Q8_0 K/V, four 250K prompts with a needle each, sent at once):
+
+| | `-kvu` (one shared cache) | One KV stream per slot |
+| --- | ---: | ---: |
+| All four prompts done after | 1367 s | **1034 s** |
+| Decode of the last chat, three others loaded | 12.1 t/s | **37.2 t/s** |
+| Needles found | 4/4 | **4/4** |
+
+Peak GTT 74.9 GiB, at least 8 GiB left. Q8_0 K/V costs no speed, and its KLD is 1.06× the f16 noise floor.
+
 **SSD KV cache:** a 29.7K-token conversation that left its slot comes back from disk in 2.5 s. On the base,
-re-prefilling it took 33.7 s.
+re-prefilling it took 33.7 s. With one stream per slot, a conversation comes back into any slot.
 
 ## What's inside
 
@@ -73,6 +83,10 @@ re-prefilling it took 33.7 s.
 - **Persistent KV cache on SSD** (`--cache-dir`): the disk tier v3 of StrixLlama, ported to Linux with direct I/O and
   without mmap. Conversations are written while they grow, restored straight into the KV cells, and kept across
   restarts.
+- **Q8_0 K/V cache for the QSA kernels** (`-ctk q8_0 -ctv q8_0`): half the attention cache, so 4 × 256K fits.
+- **One KV stream per slot** (no `-kvu`): QSA kernels, block selection, the indexer-key cache and the disk tier work per
+  stream, so every chat reads only its own cells. Bit-identical to the unified path where both apply.
+- **Legacy pool fix:** the HIP memory pool releases buffers that long prefills have outgrown (+0.3 instead of +5.1 GiB).
 
 [docs/gsqhalo/README.md](docs/gsqhalo/README.md) lists every change with its commit, its off switch where there is one,
 and its measurements.
@@ -98,7 +112,7 @@ llama-server -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
   --cache-ram 2048 -ctxcp 8 --jinja --reasoning on --reasoning-effort xhigh
 ```
 
-The docs have a two-slot config with the SSD cache, along with the flags to avoid.
+The docs have a two-slot config with the SSD cache, a four-slot 256K config with Q8_0 K/V, and the flags to avoid.
 
 ## Lineage and related forks
 
