@@ -254,10 +254,51 @@ Server with 2 slots and MTP, ext4 on a USB SSD (~600 MB/s):
 - **Restore after a server restart:** 31.8K tokens in 2.1 s.
 - **Soak test:** two 89K-token conversations alternated in one slot for 10 rounds. Each restore took 5.4–5.5 s and the
   median switch 6.2 s. After a persist and a restart, 22/22 answers were correct.
-- **Oracle:** a restore after eviction or restart is bit-identical to the reference, with and without MTP.
+- **Oracle:** without MTP, a conversation read back from the SSD continues bit-identically to one that never left its
+  slot, also in the other slot, after a restart and beside a running slot. With MTP, all answers kept their tokens.
+  See [Restore oracle](#restore-oracle).
 - **One stream per slot** (`27182eb`, 2 × 256K without `-kvu`, internal NVMe): a 24K-token conversation that left slot 0
   came back from disk into slot 1, the other stream, in 0.37 s, and only 4 prompt tokens were processed. After a
   restart, two conversations came back the same way; 7/7 needles were found.
+
+### Restore oracle
+
+A restore writes a conversation straight back into the KV cells and the recurrent state. The oracle checks that the
+conversation then continues exactly as if it had never left its slot.
+
+**Setup:** the code of `7ece4bd` with the two-slot config below, without MTP (2 × 256K, one KV stream per slot,
+f16 K/V, `-b 4096 -ub 4096`, `--cache-ram 0`, store on the internal NVMe), and with `--reasoning off`. Every phase
+starts a fresh server with an empty store. Two chats, X and Y, have 20K tokens of wikitext and two turns each. A third
+chat, C, with 3K tokens, is sent into a slot to make the chat in it leave, so that its next turn has to come back from
+the SSD. Decoding is greedy; 128 tokens with their top-3 logprobs are compared bit for bit with a reference run, in
+which each chat runs alone and never leaves its slot. The second turn continues from the end of the first: about
+20,150 of its 20,183 tokens come from the cache. With `STRIX_STATE_HASH=1`, the server logs hashes of the recurrent
+and of the whole state of a slot when a task starts and after every prompt batch.
+
+| Second turn | Compared with | Result |
+| --- | --- | --- |
+| Read back into its own slot | the chat that stayed in its slot | bit-identical, state hashes equal after the restore and after every prompt batch |
+| Read back into the other slot (other KV stream) | the chat that stayed in its slot | bit-identical |
+| Read back after `/strix/persist` and a restart | the chat that stayed in its slot | bit-identical, state hashes equal |
+| Read back while the other slot generates | the same run with both chats in their slots | bit-identical |
+| First turn of a new chat in a slot that held another chat | the same chat in an empty slot | bit-identical |
+
+Each restore read 20.1K tokens (0.63 GiB) in 0.32–0.36 s. The last row shows that nothing of the recurrent state of a
+previous conversation carries over into the next one. State hashes can only be compared within one slot, because the
+serialized state names its sequence.
+
+**Two chats generating at the same time are not bit-identical to one chat alone.** Without any restore, X and Y left
+the reference after 7 and 32 tokens. Their logprobs differed by up to 0.12 from the first token on; on tokens with
+p > 0.95, by at most 0.004. Two chats share batches, and the batch shape changes the rounding, as another ubatch size
+would. The top-k choices in QSA and in the MoE router then amplify it (see [Quality](#quality)). Nothing of the other
+chat gets in: with a partner of the same token counts but another question, X's answer stayed bit-identical. The
+restore adds nothing either: X read back from the SSD beside Y is bit-identical to X resident beside Y.
+
+**With MTP** (`--spec-draft-n-max 3`), all four restores of X and Y, into either slot, gave the same tokens as the
+reference. MTP reports logprobs only for tokens that were not drafted, so the comparison covers the tokens plus one or
+two logprobs per answer. The first token's logprob matched in all four. Y's second one, at token 28, differed by 0.08
+in both slots, although Y's state hashes after the restore into its own slot matched. The difference comes from the
+draft head: other drafts change the verify batches, and with them the rounding.
 
 ## Quick start
 

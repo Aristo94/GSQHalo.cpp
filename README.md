@@ -64,7 +64,9 @@ from 1003 to about 1350 t/s. [The docs](docs/gsqhalo/README.md#results) give eve
 Peak GTT 74.9 GiB, at least 8 GiB left. Q8_0 K/V costs no speed, and its KLD is 1.06× the f16 noise floor.
 
 **SSD KV cache:** a 29.7K-token conversation that left its slot comes back from disk in 2.5 s. On the base,
-re-prefilling it took 33.7 s. With one stream per slot, a conversation comes back into any slot.
+re-prefilling it took 33.7 s. With one stream per slot, a conversation comes back into any slot. Without MTP, it then
+continues bit-identically to a conversation that never left its slot
+([restore oracle](docs/gsqhalo/README.md#restore-oracle)).
 
 ## What's inside
 
