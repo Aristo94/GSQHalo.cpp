@@ -50,6 +50,7 @@ The full upstream history is included, and the GSQHalo commits sit on top of `30
 | QSA prefill: tile skip and class sort | `19c97f4` | `QSA_TILESKIP=0`, `QSA_CSORT=0` | Skips 16-row tiles that have no selected key in a chunk. Sorts the union blocks by tile class, so that more tiles can be skipped. |
 | QSA statistics | `3d72923` | `QSA_STATS=1` (with `GGML_CUDA_DISABLE_GRAPHS=1`) | Logs the union sizes, active tile shares and chunk distribution per call. Diagnostics only. |
 | Overlapped PLE gather | `e5171c1` | `LLAMA_INPUT_TIMING=1` logs input timings | The per-layer-embedding rows of the later ubatches are read while the first ubatch computes. Before, the reads competed with the first ubatch's cold gather. |
+| Padded hipBLASLt rows | `05b7914` | `GGML_CUDA_DISABLE_CUBLAS_PAD=1` | Above 1024 tokens, Q6_K weights are dequantized to F16 and multiplied by hipBLASLt. In `[6144 -> 2560]` the F16 rows are 12288 B apart, a multiple of 4 KB, so they fell on the same memory channels and the GEMM ran at 28 TFLOPS. The weight and the activation are now converted with 64 extra values per row. hipBLASLt keeps the same kernel: 4.58 → 2.94 ms per call. Bit-identical. |
 
 **MTP memory and prefill**
 
@@ -121,6 +122,13 @@ random tokens, which is the worst case for the embedding table on disk.
 | QSA tile skip and class sort | `19c97f4` | pp4096 @ 32768, `-lzm on-direct -b 32768 -ub 8192` | 1273.9 / 1288.0 | 1276.7 / 1307.9 (+0.9 %) |
 | Dedicated HC-Down kernel | `ba31c23` | pp4096 @ 0, median of 9 | 1374.1 | 1408.5 (+2.5 %) |
 | | | pp4096 @ 32768, median of 9 | 1312.3 | 1330.9 (+1.4 %) |
+| Padded hipBLASLt rows | `05b7914` | pp4096 @ 0, `-lzm on-direct -b/-ub 4096`, 6 samples, ABBA | 1434.2 | 1455.2 (+1.5 %) |
+| | | pp4096 @ 12000 | 1368.0 | 1380.4 (+0.9 %) |
+| | | pp4096 @ 32000 | 1345.3 | 1362.2 (+1.3 %) |
+| | | pp4096 @ 64000 | 1302.4 | 1329.5 (+2.1 %) |
+
+Each of the four padded-rows results lies within its run spread (±1.2–1.7 %), but all of them point the same way. In a
+kernel trace, the padded GEMMs of one 4096-token ubatch take 78 instead of 134 ms, 2.1 % of the ubatch's kernel time.
 
 The base is `307c50d`. `llama-bench` does not touch the disk tier, so the disk tier commits do not change these numbers.
 

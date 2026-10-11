@@ -73,6 +73,7 @@ re-prefilling it took 33.7 s. With one stream per slot, a conversation comes bac
   - slice decoders that write 8 weights per lane;
   - BF16 hyper-connection fusions and a dedicated HC-Down kernel;
   - a Q8_1 activation shared by several dense readers;
+  - padded rows for the hipBLASLt Q6_K GEMMs, so that 4 KB rows no longer share memory channels;
   - QSA attention that skips empty tiles;
   - per-layer-embedding reads overlapped with GPU work.
 - **MTP that fits:** over the prompt, the draft head computes only its K/V. It reserves buffers for that graph, not for
