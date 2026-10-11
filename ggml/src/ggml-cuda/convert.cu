@@ -329,6 +329,21 @@ static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k
 }
 
 template<typename dst_t>
+static __global__ void dequantize_block_q6_K_ld(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb_row, const int64_t ld) {
+    const int64_t i   = blockIdx.x;
+    const int64_t row = i / nb_row;
+
+    dequantize_q6_K(vx, i, yy + row*ld + (i - row*nb_row)*QK_K, threadIdx.x);
+}
+
+template<typename dst_t>
+static void dequantize_row_q6_K_ld_cuda(const void * vx, dst_t * y, const int64_t ne00, const int64_t nrows, const int64_t ld, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+    const int64_t nb_row = ne00 / QK_K;
+    dequantize_block_q6_K_ld<<<nb_row*nrows, 64, 0, stream>>>(vx, y, nb_row, ld);
+}
+
+template<typename dst_t>
 static void dequantize_row_iq2_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
@@ -543,6 +558,59 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
         }
     }
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
+}
+
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_ld(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t nrows, const int64_t ld) {
+    const int64_t i00 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i00 >= ne00) {
+        return;
+    }
+
+    const src_t * x = (const src_t *) vx;
+
+    for (int64_t i01 = blockIdx.y; i01 < nrows; i01 += gridDim.y) {
+        y[i01*ld + i00] = ggml_cuda_cast<dst_t>(x[i01*ne00 + i00]);
+    }
+}
+
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_ld_vec4(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00_4, const int64_t nrows, const int64_t ld_4) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne00_4) {
+        return;
+    }
+
+    for (int64_t i01 = blockIdx.y; i01 < nrows; i01 += gridDim.y) {
+        const cvt_vec4<src_t> xv = ((const cvt_vec4<src_t> *) vx)[i01*ne00_4 + i];
+
+        cvt_vec4<dst_t> yv;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            yv.v[j] = ggml_cuda_cast<dst_t>(xv.v[j]);
+        }
+
+        ((cvt_vec4<dst_t> *) y)[i01*ld_4 + i] = yv;
+    }
+}
+
+template <typename src_t, typename dst_t>
+static void convert_unary_ld_cuda(const void * vx, dst_t * y, const int64_t ne00, const int64_t nrows, const int64_t ld, cudaStream_t stream) {
+    const int nrows_grid = (int) std::min(nrows, (int64_t) 65535);
+    if (ne00 % 4 == 0 && ld % 4 == 0 &&
+        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 &&
+        (uintptr_t) y  % alignof(cvt_vec4<dst_t>) == 0) {
+        const dim3 num_blocks((ne00/4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, nrows_grid);
+        convert_unary_ld_vec4<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, ne00/4, nrows, ld/4);
+        return;
+    }
+
+    const dim3 num_blocks((ne00 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, nrows_grid);
+    convert_unary_ld<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, ne00, nrows, ld);
 }
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
@@ -801,6 +869,17 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
+        default:
+            return nullptr;
+    }
+}
+
+to_fp16_ld_cuda_t ggml_get_to_fp16_ld_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            return convert_unary_ld_cuda<float>;
+        case GGML_TYPE_Q6_K:
+            return dequantize_row_q6_K_ld_cuda;
         default:
             return nullptr;
     }

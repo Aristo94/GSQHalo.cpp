@@ -31,6 +31,14 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
 
+// contiguous x with nrows rows of ne00 values, row i of y starts at y + i*ld
+template<typename T>
+using to_t_ld_cuda_t = void (*)(const void * x, T * y, int64_t ne00, int64_t nrows, int64_t ld, cudaStream_t stream);
+
+typedef to_t_ld_cuda_t<half> to_fp16_ld_cuda_t;
+
+to_fp16_ld_cuda_t ggml_get_to_fp16_ld_cuda(ggml_type type);
+
 template<typename dst_t, typename src_t>
  __host__ __device__ inline dst_t ggml_cuda_cast(src_t x) {
     if constexpr (std::is_same_v<dst_t, src_t>) {
